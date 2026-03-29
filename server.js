@@ -2,18 +2,19 @@
  * ╔══════════════════════════════════════════════════════════════╗
  * ║     TIKTOK LIVE MACRO — Servidor de Licenças (Railway)      ║
  * ║     Com assinatura HMAC — respostas não podem ser falsas     ║
+ * ║     Banco de dados: Supabase PostgreSQL                      ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
  * Variáveis de ambiente OBRIGATÓRIAS no Railway:
- *   ADMIN_SECRET   → senha do painel admin  (ex: "admin-senha-forte-123")
- *   HMAC_SECRET    → chave de assinatura    (ex: gere com: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")
+ *   ADMIN_SECRET   → senha do painel admin
+ *   HMAC_SECRET    → chave de assinatura (igual ao licenseManager.js)
+ *   DATABASE_URL   → connection string do Supabase
  *   PORT           → definido automaticamente pelo Railway
  */
 
-const express = require('express');
-const fs      = require('fs');
-const path    = require('path');
-const crypto  = require('crypto');
+const express  = require('express');
+const crypto   = require('crypto');
+const { Pool } = require('pg');
 
 const app  = express();
 app.use(express.json());
@@ -22,35 +23,42 @@ app.use(express.urlencoded({ extended: true }));
 const PORT         = process.env.PORT || 3000;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'troque-esta-senha';
 const HMAC_SECRET  = process.env.HMAC_SECRET  || 'troque-esta-chave-hmac';
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error('❌ DATABASE_URL não configurado! Configure nas variáveis do Railway.');
+  process.exit(1);
+}
 
 if (HMAC_SECRET === 'troque-esta-chave-hmac') {
-  console.warn('⚠️  ATENÇÃO: HMAC_SECRET não configurado! Configure nas variáveis do Railway.');
+  console.warn('⚠️  ATENÇÃO: HMAC_SECRET não configurado!');
 }
 
-// ── BANCO DE DADOS (JSON) ─────────────────────────────────────────
-const DATA_FILE = path.join(__dirname, 'licenses.json');
+// ── BANCO DE DADOS (PostgreSQL) ───────────────────────────────────
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE))
-      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch (e) {
-    console.error('[DB] Erro ao carregar:', e.message);
-  }
-  return { keys: {} };
+// Cria a tabela se não existir
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS licenses (
+      key          TEXT PRIMARY KEY,
+      days         INTEGER NOT NULL DEFAULT 30,
+      note         TEXT    DEFAULT '',
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      activated_at TIMESTAMPTZ DEFAULT NULL,
+      expires_at   TIMESTAMPTZ DEFAULT NULL,
+      machine_id   TEXT    DEFAULT NULL,
+      revoked      BOOLEAN DEFAULT FALSE
+    )
+  `);
+  console.log('[DB] ✅ Tabela de licenças pronta.');
 }
-
-function saveData() {
-  try { fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2)); }
-  catch (e) { console.error('[DB] Erro ao salvar:', e.message); }
-}
-
-let db = loadData();
 
 // ── HMAC — ASSINAR RESPOSTA ───────────────────────────────────────
-// Garante que o Electron só aceita respostas vindas deste servidor
 function signResponse(payload) {
-  // Ordena as chaves para garantir que a assinatura seja sempre igual
   const data = JSON.stringify(payload, Object.keys(payload).sort());
   const sig  = crypto.createHmac('sha256', HMAC_SECRET).update(data).digest('hex');
   return { ...payload, _sig: sig, _ts: Date.now() };
@@ -71,20 +79,17 @@ function adminCheck(req, res) {
   return true;
 }
 
-// ── RATE LIMIT SIMPLES (anti brute-force) ─────────────────────────
-const attempts = new Map(); // ip → { count, firstAt }
-const RATE_WINDOW_MS  = 60_000; // 1 minuto
-const RATE_MAX_TRIES  = 10;     // max 10 tentativas por minuto por IP
+// ── RATE LIMIT SIMPLES ────────────────────────────────────────────
+const attempts = new Map();
+const RATE_WINDOW_MS = 60_000;
+const RATE_MAX_TRIES = 10;
 
 function rateLimit(req, res) {
   const ip  = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const rec = attempts.get(ip) || { count: 0, firstAt: now };
 
-  if (now - rec.firstAt > RATE_WINDOW_MS) {
-    rec.count = 0; rec.firstAt = now;
-  }
-
+  if (now - rec.firstAt > RATE_WINDOW_MS) { rec.count = 0; rec.firstAt = now; }
   rec.count++;
   attempts.set(ip, rec);
 
@@ -96,7 +101,6 @@ function rateLimit(req, res) {
   return true;
 }
 
-// Limpa registros antigos a cada 5 minutos
 setInterval(() => {
   const now = Date.now();
   for (const [ip, rec] of attempts)
@@ -104,7 +108,7 @@ setInterval(() => {
 }, 5 * 60_000);
 
 // ── ROTA: ATIVAR (/activate) ──────────────────────────────────────
-app.post('/activate', (req, res) => {
+app.post('/activate', async (req, res) => {
   if (!rateLimit(req, res)) return;
 
   const { key, machineId } = req.body || {};
@@ -112,37 +116,47 @@ app.post('/activate', (req, res) => {
     return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
 
   const cleanKey = key.trim().toUpperCase();
-  const entry    = db.keys[cleanKey];
 
-  if (!entry)
-    return res.json(signResponse({ ok: false, error: 'Chave inválida ou não encontrada.' }));
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
 
-  if (entry.revoked)
-    return res.json(signResponse({ ok: false, error: 'Esta chave foi revogada.' }));
+    if (!entry)
+      return res.json(signResponse({ ok: false, error: 'Chave inválida ou não encontrada.' }));
 
-  // Já ativada em outra máquina?
-  if (entry.machineId && entry.machineId !== machineId)
-    return res.json(signResponse({ ok: false, error: 'Esta chave já está ativada em outro computador.' }));
+    if (entry.revoked)
+      return res.json(signResponse({ ok: false, error: 'Esta chave foi revogada.' }));
 
-  // Primeira ativação — calcula expiração
-  if (!entry.activatedAt) {
-    const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + (entry.days || 30));
-    entry.expiresAt   = expiresAt.toISOString();
-    entry.activatedAt = new Date().toISOString();
-    entry.machineId   = machineId;
-    saveData();
-    console.log(`[ACTIVATE] ✅ ${cleanKey} ativado — ${entry.days}d — máquina ${machineId.slice(0, 8)}...`);
+    if (entry.machine_id && entry.machine_id !== machineId)
+      return res.json(signResponse({ ok: false, error: 'Esta chave já está ativada em outro computador.' }));
+
+    // Primeira ativação
+    if (!entry.activated_at) {
+      const expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + (entry.days || 30));
+
+      await pool.query(
+        'UPDATE licenses SET activated_at = NOW(), expires_at = $1, machine_id = $2 WHERE key = $3',
+        [expiresAt.toISOString(), machineId, cleanKey]
+      );
+
+      entry.expires_at = expiresAt.toISOString();
+      console.log(`[ACTIVATE] ✅ ${cleanKey} ativado — ${entry.days}d — máquina ${machineId.slice(0, 8)}...`);
+    }
+
+    if (new Date() > new Date(entry.expires_at))
+      return res.json(signResponse({ ok: false, error: 'Esta chave expirou.', expired: true }));
+
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at }));
+
+  } catch (e) {
+    console.error('[ACTIVATE] Erro:', e.message);
+    return res.json(signResponse({ ok: false, error: 'Erro interno do servidor.' }));
   }
-
-  if (new Date() > new Date(entry.expiresAt))
-    return res.json(signResponse({ ok: false, error: 'Esta chave expirou.', expired: true }));
-
-  return res.json(signResponse({ ok: true, expiresAt: entry.expiresAt }));
 });
 
 // ── ROTA: VERIFICAR (/verify) ─────────────────────────────────────
-app.post('/verify', (req, res) => {
+app.post('/verify', async (req, res) => {
   if (!rateLimit(req, res)) return;
 
   const { key, machineId } = req.body || {};
@@ -150,163 +164,198 @@ app.post('/verify', (req, res) => {
     return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
 
   const cleanKey = key.trim().toUpperCase();
-  const entry    = db.keys[cleanKey];
 
-  if (!entry || !entry.activatedAt)
-    return res.json(signResponse({ ok: false, error: 'Chave não encontrada.' }));
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
 
-  if (entry.revoked)
-    return res.json(signResponse({ ok: false, revoked: true, error: 'Chave revogada.' }));
+    if (!entry || !entry.activated_at)
+      return res.json(signResponse({ ok: false, error: 'Chave não encontrada.' }));
 
-  if (entry.machineId !== machineId)
-    return res.json(signResponse({ ok: false, error: 'Máquina não autorizada.' }));
+    if (entry.revoked)
+      return res.json(signResponse({ ok: false, revoked: true, error: 'Chave revogada.' }));
 
-  if (new Date() > new Date(entry.expiresAt))
-    return res.json(signResponse({ ok: false, expired: true, error: 'Licença expirada.' }));
+    if (entry.machine_id !== machineId)
+      return res.json(signResponse({ ok: false, error: 'Máquina não autorizada.' }));
 
-  console.log(`[VERIFY] ✅ ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
-  return res.json(signResponse({ ok: true, expiresAt: entry.expiresAt }));
+    if (new Date() > new Date(entry.expires_at))
+      return res.json(signResponse({ ok: false, expired: true, error: 'Licença expirada.' }));
+
+    console.log(`[VERIFY] ✅ ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at }));
+
+  } catch (e) {
+    console.error('[VERIFY] Erro:', e.message);
+    return res.json(signResponse({ ok: false, error: 'Erro interno do servidor.' }));
+  }
 });
 
 // ── ADMIN: CRIAR CHAVE ────────────────────────────────────────────
-app.post('/admin/create-key', (req, res) => {
+app.post('/admin/create-key', async (req, res) => {
   if (!adminCheck(req, res)) return;
 
   const { days = 30, note = '', key: customKey } = req.body;
   const newKey = customKey ? customKey.trim().toUpperCase() : generateKey();
 
-  if (db.keys[newKey])
-    return res.json({ ok: false, error: 'Chave já existe.' });
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [newKey]);
+    if (rows.length > 0)
+      return res.json({ ok: false, error: 'Chave já existe.' });
 
-  db.keys[newKey] = {
-    key: newKey, days: parseInt(days) || 30,
-    createdAt: new Date().toISOString(),
-    expiresAt: null, activatedAt: null, machineId: null,
-    revoked: false, note,
-  };
+    await pool.query(
+      'INSERT INTO licenses (key, days, note) VALUES ($1, $2, $3)',
+      [newKey, parseInt(days) || 30, note]
+    );
 
-  saveData();
-  console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days} dias) — ${note}`);
+    console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days} dias) — ${note}`);
 
-  // Se veio do form HTML, redireciona pro painel
-  const accept = req.headers['accept'] || '';
-  if (accept.includes('text/html'))
-    return res.redirect(`/admin?secret=${req.body.secret}`);
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect(`/admin?secret=${req.body.secret}`);
 
-  return res.json({ ok: true, key: newKey, days: parseInt(days) || 30 });
+    return res.json({ ok: true, key: newKey, days: parseInt(days) || 30 });
+
+  } catch (e) {
+    console.error('[CREATE-KEY] Erro:', e.message);
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
 });
 
 // ── ADMIN: REVOGAR CHAVE ──────────────────────────────────────────
-app.post('/admin/revoke-key', (req, res) => {
+app.post('/admin/revoke-key', async (req, res) => {
   if (!adminCheck(req, res)) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
-  const entry = db.keys[cleanKey];
-  if (!entry) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  entry.revoked = true;
-  saveData();
-  console.log(`[ADMIN] 🚫 Revogada: ${cleanKey}`);
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  const accept = req.headers['accept'] || '';
-  if (accept.includes('text/html'))
-    return res.redirect(`/admin?secret=${req.body.secret}`);
+    await pool.query('UPDATE licenses SET revoked = TRUE WHERE key = $1', [cleanKey]);
+    console.log(`[ADMIN] 🚫 Revogada: ${cleanKey}`);
 
-  return res.json({ ok: true });
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect(`/admin?secret=${req.body.secret}`);
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
 });
 
-// ── ADMIN: RENOVAR / EXTENDER DIAS ───────────────────────────────
-app.post('/admin/extend-key', (req, res) => {
+// ── ADMIN: EXTENDER DIAS ──────────────────────────────────────────
+app.post('/admin/extend-key', async (req, res) => {
   if (!adminCheck(req, res)) return;
 
   const cleanKey  = (req.body.key || '').trim().toUpperCase();
   const extraDays = parseInt(req.body.days) || 30;
-  const entry = db.keys[cleanKey];
-  if (!entry) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  const base = entry.expiresAt ? new Date(entry.expiresAt) : new Date();
-  base.setDate(base.getDate() + extraDays);
-  entry.expiresAt = base.toISOString();
-  entry.revoked = false;
-  saveData();
-  console.log(`[ADMIN] ➕ ${cleanKey} extendida por ${extraDays} dias → expira ${entry.expiresAt}`);
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  const accept = req.headers['accept'] || '';
-  if (accept.includes('text/html'))
-    return res.redirect(`/admin?secret=${req.body.secret}`);
+    const entry = rows[0];
+    const base  = entry.expires_at ? new Date(entry.expires_at) : new Date();
+    base.setDate(base.getDate() + extraDays);
 
-  return res.json({ ok: true, expiresAt: entry.expiresAt });
+    await pool.query(
+      'UPDATE licenses SET expires_at = $1, revoked = FALSE WHERE key = $2',
+      [base.toISOString(), cleanKey]
+    );
+
+    console.log(`[ADMIN] ➕ ${cleanKey} extendida por ${extraDays} dias → expira ${base.toISOString()}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect(`/admin?secret=${req.body.secret}`);
+
+    return res.json({ ok: true, expiresAt: base.toISOString() });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
 });
 
 // ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
-app.post('/admin/reset-machine', (req, res) => {
+app.post('/admin/reset-machine', async (req, res) => {
   if (!adminCheck(req, res)) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
-  const entry = db.keys[cleanKey];
-  if (!entry) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  entry.machineId   = null;
-  entry.activatedAt = null;
-  entry.expiresAt   = null;
-  saveData();
-  console.log(`[ADMIN] 🔄 Máquina resetada: ${cleanKey}`);
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
 
-  const accept = req.headers['accept'] || '';
-  if (accept.includes('text/html'))
-    return res.redirect(`/admin?secret=${req.body.secret}`);
+    await pool.query(
+      'UPDATE licenses SET machine_id = NULL, activated_at = NULL, expires_at = NULL WHERE key = $1',
+      [cleanKey]
+    );
 
-  return res.json({ ok: true });
+    console.log(`[ADMIN] 🔄 Máquina resetada: ${cleanKey}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect(`/admin?secret=${req.body.secret}`);
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
 });
 
 // ── ADMIN: PAINEL HTML ────────────────────────────────────────────
-app.get('/admin', (req, res) => {
+app.get('/admin', async (req, res) => {
   if (!adminCheck(req, res)) return;
 
   const secret = req.query.secret;
-  const keys   = Object.values(db.keys);
-  const now    = new Date();
 
-  const rows = keys.map(k => {
-    const exp    = k.expiresAt ? new Date(k.expiresAt).toLocaleDateString('pt-BR') : '—';
-    const active = k.activatedAt && !k.revoked && now < new Date(k.expiresAt || 0);
-    const status = k.revoked ? '🚫 Revogada' : !k.activatedAt ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
-    const rowColor = k.revoked ? '#2a1a1a' : !k.activatedAt ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
-    return `<tr style="background:${rowColor}">
-      <td style="font-family:monospace;font-size:13px">${k.key}</td>
-      <td>${k.note || '—'}</td>
-      <td style="text-align:center">${k.days}d</td>
-      <td>${status}</td>
-      <td style="text-align:center">${exp}</td>
-      <td style="font-family:monospace;font-size:11px">${k.machineId ? k.machineId.slice(0,8)+'...' : '—'}</td>
-      <td>
-        <form method="POST" action="/admin/extend-key" style="display:inline">
-          <input type="hidden" name="secret" value="${secret}"/>
-          <input type="hidden" name="key" value="${k.key}"/>
-          <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
-          <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
-        </form>
-        <form method="POST" action="/admin/reset-machine" style="display:inline;margin-left:4px">
-          <input type="hidden" name="secret" value="${secret}"/>
-          <input type="hidden" name="key" value="${k.key}"/>
-          <button type="submit" style="background:#FFBE0B;color:#000;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">reset PC</button>
-        </form>
-        <form method="POST" action="/admin/revoke-key" style="display:inline;margin-left:4px" onsubmit="return confirm('Revogar ${k.key}?')">
-          <input type="hidden" name="secret" value="${secret}"/>
-          <input type="hidden" name="key" value="${k.key}"/>
-          <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">revogar</button>
-        </form>
-      </td>
-    </tr>`;
-  }).join('');
+  try {
+    const { rows: keys } = await pool.query('SELECT * FROM licenses ORDER BY created_at DESC');
+    const now = new Date();
 
-  const total   = keys.length;
-  const ativas  = keys.filter(k => k.activatedAt && !k.revoked && now < new Date(k.expiresAt || 0)).length;
-  const naAtiv  = keys.filter(k => !k.activatedAt).length;
-  const revog   = keys.filter(k => k.revoked).length;
-  const expir   = keys.filter(k => k.activatedAt && !k.revoked && now >= new Date(k.expiresAt || 0)).length;
+    const rows = keys.map(k => {
+      const exp    = k.expires_at ? new Date(k.expires_at).toLocaleDateString('pt-BR') : '—';
+      const active = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
+      const status = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
+      const rowColor = k.revoked ? '#2a1a1a' : !k.activated_at ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
+      return `<tr style="background:${rowColor}">
+        <td style="font-family:monospace;font-size:13px">${k.key}</td>
+        <td>${k.note || '—'}</td>
+        <td style="text-align:center">${k.days}d</td>
+        <td>${status}</td>
+        <td style="text-align:center">${exp}</td>
+        <td style="font-family:monospace;font-size:11px">${k.machine_id ? k.machine_id.slice(0,8)+'...' : '—'}</td>
+        <td>
+          <form method="POST" action="/admin/extend-key" style="display:inline">
+            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="key" value="${k.key}"/>
+            <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
+            <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
+          </form>
+          <form method="POST" action="/admin/reset-machine" style="display:inline;margin-left:4px">
+            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="key" value="${k.key}"/>
+            <button type="submit" style="background:#FFBE0B;color:#000;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">reset PC</button>
+          </form>
+          <form method="POST" action="/admin/revoke-key" style="display:inline;margin-left:4px" onsubmit="return confirm('Revogar ${k.key}?')">
+            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="key" value="${k.key}"/>
+            <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">revogar</button>
+          </form>
+        </td>
+      </tr>`;
+    }).join('');
 
-  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+    const total  = keys.length;
+    const ativas = keys.filter(k => k.activated_at && !k.revoked && now < new Date(k.expires_at || 0)).length;
+    const naAtiv = keys.filter(k => !k.activated_at).length;
+    const revog  = keys.filter(k => k.revoked).length;
+    const expir  = keys.filter(k => k.activated_at && !k.revoked && now >= new Date(k.expires_at || 0)).length;
+
+    res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>Admin — TTLM Licenças</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -357,19 +406,34 @@ tr:hover{filter:brightness(1.2)}
   </table>
 </div>
 </body></html>`);
+
+  } catch (e) {
+    console.error('[ADMIN] Erro:', e.message);
+    res.status(500).send('Erro ao carregar painel.');
+  }
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'TTLM License Server v2', keys: Object.keys(db.keys).length });
+app.get('/', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) FROM licenses');
+    res.json({ status: 'ok', service: 'TTLM License Server v3 (Supabase)', keys: parseInt(rows[0].count) });
+  } catch {
+    res.json({ status: 'ok', service: 'TTLM License Server v3 (Supabase)', db: 'conectando...' });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`\n══════════════════════════════════════`);
-  console.log(`   TTLM License Server v2 (HMAC)`);
-  console.log(`   Porta: ${PORT}`);
-  console.log(`   Chaves: ${Object.keys(db.keys).length}`);
-  console.log(`   Admin: /admin?secret=SUA_SENHA`);
-  console.log(`   HMAC: ${HMAC_SECRET !== 'troque-esta-chave-hmac' ? '✅ configurado' : '⚠️  NÃO configurado!'}`);
-  console.log(`══════════════════════════════════════\n`);
+// ── INICIAR ───────────────────────────────────────────────────────
+initDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n══════════════════════════════════════`);
+    console.log(`   TTLM License Server v3 (Supabase)`);
+    console.log(`   Porta: ${PORT}`);
+    console.log(`   Admin: /admin?secret=SUA_SENHA`);
+    console.log(`   HMAC: ${HMAC_SECRET !== 'troque-esta-chave-hmac' ? '✅ configurado' : '⚠️  NÃO configurado!'}`);
+    console.log(`══════════════════════════════════════\n`);
+  });
+}).catch(e => {
+  console.error('❌ Erro ao conectar no banco:', e.message);
+  process.exit(1);
 });
