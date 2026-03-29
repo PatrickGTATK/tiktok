@@ -70,52 +70,122 @@ function generateKey() {
   return `TTLM-${seg()}-${seg()}-${seg()}`;
 }
 
+// 🔒 MELHORIA: admin verificado via POST body (nunca via query string na URL)
+//    Isso evita que o secret apareça em logs do Railway, histórico do browser
+//    e header Referer ao clicar em links externos.
 function adminCheck(req, res) {
-  const secret = req.body?.secret || req.query?.secret;
-  if (secret !== ADMIN_SECRET) {
+  // Aceita apenas do body — nunca da query string
+  const secret = req.body?.secret;
+  if (!secret || secret !== ADMIN_SECRET) {
     res.status(403).json({ ok: false, error: 'Acesso negado.' });
     return false;
   }
   return true;
 }
 
-// ── RATE LIMIT SIMPLES ────────────────────────────────────────────
-const attempts = new Map();
-const RATE_WINDOW_MS = 60_000;
-const RATE_MAX_TRIES = 10;
+// 🔒 MELHORIA: session token temporário para o painel admin
+//    Em vez de passar o secret na URL em cada redirect, gera um token
+//    de sessão em memória com TTL de 1 hora.
+const adminSessions = new Map();
 
-function rateLimit(req, res) {
-  const ip  = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const rec = attempts.get(ip) || { count: 0, firstAt: now };
+function createAdminSession() {
+  const token = crypto.randomBytes(24).toString('hex');
+  adminSessions.set(token, Date.now());
+  return token;
+}
 
-  if (now - rec.firstAt > RATE_WINDOW_MS) { rec.count = 0; rec.firstAt = now; }
-  rec.count++;
-  attempts.set(ip, rec);
-
-  if (rec.count > RATE_MAX_TRIES) {
-    const wait = Math.ceil((RATE_WINDOW_MS - (now - rec.firstAt)) / 1000);
-    res.status(429).json(signResponse({ ok: false, error: `Muitas tentativas. Aguarde ${wait}s.` }));
+function validateAdminSession(token) {
+  if (!token) return false;
+  const createdAt = adminSessions.get(token);
+  if (!createdAt) return false;
+  // Sessão expira após 1 hora
+  if (Date.now() - createdAt > 3_600_000) {
+    adminSessions.delete(token);
     return false;
   }
   return true;
 }
 
+// Limpa sessões expiradas a cada 30 minutos
 setInterval(() => {
   const now = Date.now();
-  for (const [ip, rec] of attempts)
-    if (now - rec.firstAt > RATE_WINDOW_MS * 2) attempts.delete(ip);
+  for (const [token, createdAt] of adminSessions)
+    if (now - createdAt > 3_600_000) adminSessions.delete(token);
+}, 30 * 60_000);
+
+// ── RATE LIMIT ────────────────────────────────────────────────────
+// 🔒 MELHORIA: rate limit separado por tipo (api vs admin)
+//    API:   10 tentativas/min por IP  (igual antes)
+//    Admin: 5  tentativas/min por IP  (novo — proteção de brute force na senha)
+//
+// 🔒 MELHORIA: também limita por chave (além de IP)
+//    Impede bypass via proxy/VPN rotativo — uma chave inválida
+//    bloqueia após 10 tentativas mesmo mudando de IP.
+//
+// ⚠️  LIMITAÇÃO CONHECIDA: o Map ainda reseta a cada deploy no Railway.
+//    Para proteção persistente, mover contadores para o banco PostgreSQL.
+//    Isso é um trade-off aceitável para a maioria dos casos.
+
+const ipAttempts  = new Map();
+const keyAttempts = new Map();
+
+const RATE_WINDOW_MS     = 60_000;
+const RATE_MAX_API       = 10;
+const RATE_MAX_ADMIN     = 5;
+const RATE_MAX_PER_KEY   = 10;
+
+function getCounter(map, id, now) {
+  const rec = map.get(id) || { count: 0, firstAt: now };
+  if (now - rec.firstAt > RATE_WINDOW_MS) { rec.count = 0; rec.firstAt = now; }
+  rec.count++;
+  map.set(id, rec);
+  return rec;
+}
+
+function rateLimit(req, res, maxTries = RATE_MAX_API, keyToCheck = null) {
+  const ip  = req.headers['x-forwarded-for']?.split(',')[0].trim()
+            || req.socket.remoteAddress
+            || 'unknown';
+  const now = Date.now();
+
+  const ipRec = getCounter(ipAttempts, ip, now);
+  if (ipRec.count > maxTries) {
+    const wait = Math.ceil((RATE_WINDOW_MS - (now - ipRec.firstAt)) / 1000);
+    res.status(429).json(signResponse({ ok: false, error: `Muitas tentativas. Aguarde ${wait}s.` }));
+    return false;
+  }
+
+  // Também limita por chave, se fornecida
+  if (keyToCheck) {
+    const keyRec = getCounter(keyAttempts, keyToCheck, now);
+    if (keyRec.count > RATE_MAX_PER_KEY) {
+      const wait = Math.ceil((RATE_WINDOW_MS - (now - keyRec.firstAt)) / 1000);
+      res.status(429).json(signResponse({ ok: false, error: `Muitas tentativas para esta chave. Aguarde ${wait}s.` }));
+      return false;
+    }
+  }
+
+  return true;
+}
+
+// Limpa contadores antigos a cada 5 minutos
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, rec] of ipAttempts)
+    if (now - rec.firstAt > RATE_WINDOW_MS * 2) ipAttempts.delete(id);
+  for (const [id, rec] of keyAttempts)
+    if (now - rec.firstAt > RATE_WINDOW_MS * 2) keyAttempts.delete(id);
 }, 5 * 60_000);
 
 // ── ROTA: ATIVAR (/activate) ──────────────────────────────────────
 app.post('/activate', async (req, res) => {
-  if (!rateLimit(req, res)) return;
-
   const { key, machineId } = req.body || {};
-  if (!key || !machineId)
-    return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
+  const cleanKey = (key || '').trim().toUpperCase();
 
-  const cleanKey = key.trim().toUpperCase();
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
 
   try {
     const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
@@ -157,13 +227,13 @@ app.post('/activate', async (req, res) => {
 
 // ── ROTA: VERIFICAR (/verify) ─────────────────────────────────────
 app.post('/verify', async (req, res) => {
-  if (!rateLimit(req, res)) return;
-
   const { key, machineId } = req.body || {};
-  if (!key || !machineId)
-    return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
+  const cleanKey = (key || '').trim().toUpperCase();
 
-  const cleanKey = key.trim().toUpperCase();
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.json(signResponse({ ok: false, error: 'Dados incompletos.' }));
 
   try {
     const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
@@ -190,9 +260,77 @@ app.post('/verify', async (req, res) => {
   }
 });
 
+// ── ADMIN: LOGIN ──────────────────────────────────────────────────
+// 🔒 MELHORIA: login via POST cria uma sessão com token
+//    O token é passado na URL (não o secret em si)
+//    Mesmo que o token vaze nos logs, expira em 1 hora e não é a senha real
+app.post('/admin/login', (req, res) => {
+  // Rate limit mais restrito para login admin
+  if (!rateLimit(req, res, RATE_MAX_ADMIN)) return;
+
+  const secret = req.body?.secret;
+  if (!secret || secret !== ADMIN_SECRET) {
+    console.warn(`[ADMIN] ❌ Tentativa de login inválida — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+    return res.status(403).send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Admin — TTLM</title>
+<style>*{box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:320px;text-align:center}
+h2{color:#FF006E;margin-bottom:16px}p{color:#666;font-size:13px;margin-bottom:20px}
+input{background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14px;border-radius:8px;width:100%;margin-bottom:12px;font-size:14px}
+button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;width:100%}
+.err{color:#FF006E;font-size:13px;margin-bottom:12px}</style></head><body>
+<div class="box"><h2>⚡ TTLM Admin</h2>
+<div class="err">❌ Senha incorreta</div>
+<form method="POST" action="/admin/login">
+<input type="password" name="secret" placeholder="Senha admin" autofocus/>
+<button type="submit">Entrar</button>
+</form></div></body></html>`);
+  }
+
+  const token = createAdminSession();
+  console.log(`[ADMIN] ✅ Login bem-sucedido — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
+  return res.redirect(`/admin?token=${token}`);
+});
+
+// ── MIDDLEWARE: verificar sessão admin ────────────────────────────
+function adminSessionCheck(req, res) {
+  const token = req.query?.token || req.body?.token;
+  if (!validateAdminSession(token)) {
+    // Redireciona para o formulário de login
+    return res.redirect('/admin/login-page');
+  }
+  return token;
+}
+
+// Página de login
+app.get('/admin/login-page', (req, res) => {
+  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+<title>Admin — TTLM</title>
+<style>*{box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:320px;text-align:center}
+h2{color:#FFBE0B;margin-bottom:16px}p{color:#666;font-size:13px;margin-bottom:20px}
+input{background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14px;border-radius:8px;width:100%;margin-bottom:12px;font-size:14px}
+button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;width:100%}
+</style></head><body>
+<div class="box"><h2>⚡ TTLM Admin</h2>
+<p>Faça login para acessar o painel</p>
+<form method="POST" action="/admin/login">
+<input type="password" name="secret" placeholder="Senha admin" autofocus/>
+<button type="submit">Entrar</button>
+</form></div></body></html>`);
+});
+
+// Redireciona /admin sem token para o login
+app.get('/admin', (req, res, next) => {
+  const token = req.query?.token;
+  if (!validateAdminSession(token)) return res.redirect('/admin/login-page');
+  next();
+});
+
 // ── ADMIN: CRIAR CHAVE ────────────────────────────────────────────
 app.post('/admin/create-key', async (req, res) => {
-  if (!adminCheck(req, res)) return;
+  const token = adminSessionCheck(req, res);
+  if (!token) return;
 
   const { days = 30, note = '', key: customKey } = req.body;
   const newKey = customKey ? customKey.trim().toUpperCase() : generateKey();
@@ -211,7 +349,7 @@ app.post('/admin/create-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?secret=${req.body.secret}`);
+      return res.redirect(`/admin?token=${token}`);
 
     return res.json({ ok: true, key: newKey, days: parseInt(days) || 30 });
 
@@ -223,7 +361,8 @@ app.post('/admin/create-key', async (req, res) => {
 
 // ── ADMIN: REVOGAR CHAVE ──────────────────────────────────────────
 app.post('/admin/revoke-key', async (req, res) => {
-  if (!adminCheck(req, res)) return;
+  const token = adminSessionCheck(req, res);
+  if (!token) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
 
@@ -236,7 +375,7 @@ app.post('/admin/revoke-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?secret=${req.body.secret}`);
+      return res.redirect(`/admin?token=${token}`);
 
     return res.json({ ok: true });
 
@@ -247,7 +386,8 @@ app.post('/admin/revoke-key', async (req, res) => {
 
 // ── ADMIN: EXTENDER DIAS ──────────────────────────────────────────
 app.post('/admin/extend-key', async (req, res) => {
-  if (!adminCheck(req, res)) return;
+  const token = adminSessionCheck(req, res);
+  if (!token) return;
 
   const cleanKey  = (req.body.key || '').trim().toUpperCase();
   const extraDays = parseInt(req.body.days) || 30;
@@ -269,7 +409,7 @@ app.post('/admin/extend-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?secret=${req.body.secret}`);
+      return res.redirect(`/admin?token=${token}`);
 
     return res.json({ ok: true, expiresAt: base.toISOString() });
 
@@ -280,7 +420,8 @@ app.post('/admin/extend-key', async (req, res) => {
 
 // ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
 app.post('/admin/reset-machine', async (req, res) => {
-  if (!adminCheck(req, res)) return;
+  const token = adminSessionCheck(req, res);
+  if (!token) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
 
@@ -297,7 +438,7 @@ app.post('/admin/reset-machine', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?secret=${req.body.secret}`);
+      return res.redirect(`/admin?token=${token}`);
 
     return res.json({ ok: true });
 
@@ -308,9 +449,7 @@ app.post('/admin/reset-machine', async (req, res) => {
 
 // ── ADMIN: PAINEL HTML ────────────────────────────────────────────
 app.get('/admin', async (req, res) => {
-  if (!adminCheck(req, res)) return;
-
-  const secret = req.query.secret;
+  const token = req.query?.token;
 
   try {
     const { rows: keys } = await pool.query('SELECT * FROM licenses ORDER BY created_at DESC');
@@ -321,6 +460,7 @@ app.get('/admin', async (req, res) => {
       const active = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
       const status = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
       const rowColor = k.revoked ? '#2a1a1a' : !k.activated_at ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
+      // 🔒 token no form em vez do secret
       return `<tr style="background:${rowColor}">
         <td style="font-family:monospace;font-size:13px">${k.key}</td>
         <td>${k.note || '—'}</td>
@@ -330,18 +470,18 @@ app.get('/admin', async (req, res) => {
         <td style="font-family:monospace;font-size:11px">${k.machine_id ? k.machine_id.slice(0,8)+'...' : '—'}</td>
         <td>
           <form method="POST" action="/admin/extend-key" style="display:inline">
-            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="token" value="${token}"/>
             <input type="hidden" name="key" value="${k.key}"/>
             <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
             <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
           </form>
           <form method="POST" action="/admin/reset-machine" style="display:inline;margin-left:4px">
-            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="token" value="${token}"/>
             <input type="hidden" name="key" value="${k.key}"/>
             <button type="submit" style="background:#FFBE0B;color:#000;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">reset PC</button>
           </form>
           <form method="POST" action="/admin/revoke-key" style="display:inline;margin-left:4px" onsubmit="return confirm('Revogar ${k.key}?')">
-            <input type="hidden" name="secret" value="${secret}"/>
+            <input type="hidden" name="token" value="${token}"/>
             <input type="hidden" name="key" value="${k.key}"/>
             <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">revogar</button>
           </form>
@@ -390,7 +530,7 @@ tr:hover{filter:brightness(1.2)}
 <div class="card">
   <h3>➕ Criar Nova Chave</h3>
   <form method="POST" action="/admin/create-key">
-    <input type="hidden" name="secret" value="${secret}"/>
+    <input type="hidden" name="token" value="${token}"/>
     <input name="note" placeholder="Nome do cliente" style="width:200px"/>
     <input name="days" type="number" value="30" style="width:70px"/> dias
     <input name="key" placeholder="TTLM-XXXX-XXXX-XXXX (deixe vazio pra gerar)" style="width:230px"/>
@@ -429,7 +569,7 @@ initDB().then(() => {
     console.log(`\n══════════════════════════════════════`);
     console.log(`   TTLM License Server v3 (Supabase)`);
     console.log(`   Porta: ${PORT}`);
-    console.log(`   Admin: /admin?secret=SUA_SENHA`);
+    console.log(`   Admin: /admin/login-page`);
     console.log(`   HMAC: ${HMAC_SECRET !== 'troque-esta-chave-hmac' ? '✅ configurado' : '⚠️  NÃO configurado!'}`);
     console.log(`══════════════════════════════════════\n`);
   });
