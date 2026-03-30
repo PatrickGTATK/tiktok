@@ -10,6 +10,13 @@
  *   HMAC_SECRET    → chave de assinatura (igual ao licenseManager.js)
  *   DATABASE_URL   → connection string do Supabase
  *   PORT           → definido automaticamente pelo Railway
+ *
+ * TIERS:
+ *   'basic' → apenas LiveMacro Pro
+ *   'full'  → LiveMacro Pro + Arena PvP
+ *
+ * MIGRATION (rode uma vez no Supabase SQL Editor):
+ *   ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'basic';
  */
 
 const express  = require('express');
@@ -46,6 +53,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS licenses (
       key          TEXT PRIMARY KEY,
       days         INTEGER NOT NULL DEFAULT 30,
+      tier         TEXT    NOT NULL DEFAULT 'basic',
       note         TEXT    DEFAULT '',
       created_at   TIMESTAMPTZ DEFAULT NOW(),
       activated_at TIMESTAMPTZ DEFAULT NULL,
@@ -54,6 +62,12 @@ async function initDB() {
       revoked      BOOLEAN DEFAULT FALSE
     )
   `);
+
+  // Garante que tabelas existentes também tenham a coluna tier
+  await pool.query(`
+    ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'basic'
+  `);
+
   console.log('[DB] ✅ Tabela de licenças pronta.');
 }
 
@@ -70,11 +84,8 @@ function generateKey() {
   return `TTLM-${seg()}-${seg()}-${seg()}`;
 }
 
-// 🔒 MELHORIA: admin verificado via POST body (nunca via query string na URL)
-//    Isso evita que o secret apareça em logs do Railway, histórico do browser
-//    e header Referer ao clicar em links externos.
+// 🔒 admin verificado via POST body (nunca via query string na URL)
 function adminCheck(req, res) {
-  // Aceita apenas do body — nunca da query string
   const secret = req.body?.secret;
   if (!secret || secret !== ADMIN_SECRET) {
     res.status(403).json({ ok: false, error: 'Acesso negado.' });
@@ -83,9 +94,7 @@ function adminCheck(req, res) {
   return true;
 }
 
-// 🔒 MELHORIA: session token temporário para o painel admin
-//    Em vez de passar o secret na URL em cada redirect, gera um token
-//    de sessão em memória com TTL de 1 hora.
+// 🔒 session token temporário para o painel admin (TTL de 1 hora)
 const adminSessions = new Map();
 
 function createAdminSession() {
@@ -98,7 +107,6 @@ function validateAdminSession(token) {
   if (!token) return false;
   const createdAt = adminSessions.get(token);
   if (!createdAt) return false;
-  // Sessão expira após 1 hora
   if (Date.now() - createdAt > 3_600_000) {
     adminSessions.delete(token);
     return false;
@@ -114,18 +122,6 @@ setInterval(() => {
 }, 30 * 60_000);
 
 // ── RATE LIMIT ────────────────────────────────────────────────────
-// 🔒 MELHORIA: rate limit separado por tipo (api vs admin)
-//    API:   10 tentativas/min por IP  (igual antes)
-//    Admin: 5  tentativas/min por IP  (novo — proteção de brute force na senha)
-//
-// 🔒 MELHORIA: também limita por chave (além de IP)
-//    Impede bypass via proxy/VPN rotativo — uma chave inválida
-//    bloqueia após 10 tentativas mesmo mudando de IP.
-//
-// ⚠️  LIMITAÇÃO CONHECIDA: o Map ainda reseta a cada deploy no Railway.
-//    Para proteção persistente, mover contadores para o banco PostgreSQL.
-//    Isso é um trade-off aceitável para a maioria dos casos.
-
 const ipAttempts  = new Map();
 const keyAttempts = new Map();
 
@@ -155,7 +151,6 @@ function rateLimit(req, res, maxTries = RATE_MAX_API, keyToCheck = null) {
     return false;
   }
 
-  // Também limita por chave, se fornecida
   if (keyToCheck) {
     const keyRec = getCounter(keyAttempts, keyToCheck, now);
     if (keyRec.count > RATE_MAX_PER_KEY) {
@@ -217,7 +212,10 @@ app.post('/activate', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, error: 'Esta chave expirou.', expired: true }));
 
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at }));
+    // tier incluso ANTES de assinar — obrigatório para HMAC bater no cliente
+    const tier = entry.tier || 'basic';
+    console.log(`[ACTIVATE] ✅ ${cleanKey} — tier: ${tier}`);
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier }));
 
   } catch (e) {
     console.error('[ACTIVATE] Erro:', e.message);
@@ -251,8 +249,10 @@ app.post('/verify', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, expired: true, error: 'Licença expirada.' }));
 
-    console.log(`[VERIFY] ✅ ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at }));
+    // tier incluso ANTES de assinar — obrigatório para HMAC bater no cliente
+    const tier = entry.tier || 'basic';
+    console.log(`[VERIFY] ✅ ${cleanKey} — tier: ${tier}`);
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier }));
 
   } catch (e) {
     console.error('[VERIFY] Erro:', e.message);
@@ -261,11 +261,7 @@ app.post('/verify', async (req, res) => {
 });
 
 // ── ADMIN: LOGIN ──────────────────────────────────────────────────
-// 🔒 MELHORIA: login via POST cria uma sessão com token
-//    O token é passado na URL (não o secret em si)
-//    Mesmo que o token vaze nos logs, expira em 1 hora e não é a senha real
 app.post('/admin/login', (req, res) => {
-  // Rate limit mais restrito para login admin
   if (!rateLimit(req, res, RATE_MAX_ADMIN)) return;
 
   const secret = req.body?.secret;
@@ -296,7 +292,6 @@ button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none
 function adminSessionCheck(req, res) {
   const token = req.query?.token || req.body?.token;
   if (!validateAdminSession(token)) {
-    // Redireciona para o formulário de login
     return res.redirect('/admin/login-page');
   }
   return token;
@@ -332,8 +327,9 @@ app.post('/admin/create-key', async (req, res) => {
   const token = adminSessionCheck(req, res);
   if (!token) return;
 
-  const { days = 30, note = '', key: customKey } = req.body;
-  const newKey = customKey ? customKey.trim().toUpperCase() : generateKey();
+  const { days = 30, note = '', key: customKey, tier = 'basic' } = req.body;
+  const newKey   = customKey ? customKey.trim().toUpperCase() : generateKey();
+  const safeTier = tier === 'full' ? 'full' : 'basic';
 
   try {
     const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [newKey]);
@@ -341,17 +337,17 @@ app.post('/admin/create-key', async (req, res) => {
       return res.json({ ok: false, error: 'Chave já existe.' });
 
     await pool.query(
-      'INSERT INTO licenses (key, days, note) VALUES ($1, $2, $3)',
-      [newKey, parseInt(days) || 30, note]
+      'INSERT INTO licenses (key, days, note, tier) VALUES ($1, $2, $3, $4)',
+      [newKey, parseInt(days) || 30, note, safeTier]
     );
 
-    console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days} dias) — ${note}`);
+    console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days} dias, tier: ${safeTier}) — ${note}`);
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
       return res.redirect(`/admin?token=${token}`);
 
-    return res.json({ ok: true, key: newKey, days: parseInt(days) || 30 });
+    return res.json({ ok: true, key: newKey, days: parseInt(days) || 30, tier: safeTier });
 
   } catch (e) {
     console.error('[CREATE-KEY] Erro:', e.message);
@@ -418,6 +414,32 @@ app.post('/admin/extend-key', async (req, res) => {
   }
 });
 
+// ── ADMIN: ALTERAR TIER ───────────────────────────────────────────
+app.post('/admin/set-tier', async (req, res) => {
+  const token = adminSessionCheck(req, res);
+  if (!token) return;
+
+  const cleanKey = (req.body.key || '').trim().toUpperCase();
+  const safeTier = req.body.tier === 'full' ? 'full' : 'basic';
+
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
+
+    await pool.query('UPDATE licenses SET tier = $1 WHERE key = $2', [safeTier, cleanKey]);
+    console.log(`[ADMIN] 🔧 Tier alterado: ${cleanKey} → ${safeTier}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect(`/admin?token=${token}`);
+
+    return res.json({ ok: true, tier: safeTier });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
 // ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
 app.post('/admin/reset-machine', async (req, res) => {
   const token = adminSessionCheck(req, res);
@@ -456,15 +478,19 @@ app.get('/admin', async (req, res) => {
     const now = new Date();
 
     const rows = keys.map(k => {
-      const exp    = k.expires_at ? new Date(k.expires_at).toLocaleDateString('pt-BR') : '—';
-      const active = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
-      const status = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
+      const exp      = k.expires_at ? new Date(k.expires_at).toLocaleDateString('pt-BR') : '—';
+      const active   = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
+      const status   = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
       const rowColor = k.revoked ? '#2a1a1a' : !k.activated_at ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
-      // 🔒 token no form em vez do secret
+      const tierBadge = k.tier === 'full'
+        ? '<span style="background:#8338EC;color:#fff;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700">FULL</span>'
+        : '<span style="background:#333;color:#aaa;padding:2px 7px;border-radius:10px;font-size:10px">basic</span>';
+
       return `<tr style="background:${rowColor}">
         <td style="font-family:monospace;font-size:13px">${k.key}</td>
         <td>${k.note || '—'}</td>
         <td style="text-align:center">${k.days}d</td>
+        <td style="text-align:center">${tierBadge}</td>
         <td>${status}</td>
         <td style="text-align:center">${exp}</td>
         <td style="font-family:monospace;font-size:11px">${k.machine_id ? k.machine_id.slice(0,8)+'...' : '—'}</td>
@@ -474,6 +500,15 @@ app.get('/admin', async (req, res) => {
             <input type="hidden" name="key" value="${k.key}"/>
             <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
             <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
+          </form>
+          <form method="POST" action="/admin/set-tier" style="display:inline;margin-left:4px">
+            <input type="hidden" name="token" value="${token}"/>
+            <input type="hidden" name="key" value="${k.key}"/>
+            <select name="tier" style="background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px;font-size:11px">
+              <option value="basic" ${k.tier !== 'full' ? 'selected' : ''}>basic</option>
+              <option value="full"  ${k.tier === 'full' ? 'selected' : ''}>full</option>
+            </select>
+            <button type="submit" style="background:#8338EC;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">tier</button>
           </form>
           <form method="POST" action="/admin/reset-machine" style="display:inline;margin-left:4px">
             <input type="hidden" name="token" value="${token}"/>
@@ -494,6 +529,7 @@ app.get('/admin', async (req, res) => {
     const naAtiv = keys.filter(k => !k.activated_at).length;
     const revog  = keys.filter(k => k.revoked).length;
     const expir  = keys.filter(k => k.activated_at && !k.revoked && now >= new Date(k.expires_at || 0)).length;
+    const fullT  = keys.filter(k => k.tier === 'full').length;
 
     res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>Admin — TTLM Licenças</title>
@@ -522,6 +558,7 @@ tr:hover{filter:brightness(1.2)}
 <div class="stats">
   <div class="stat"><b>${total}</b><span>Total</span></div>
   <div class="stat"><b style="color:#06D6A0">${ativas}</b><span>Ativas</span></div>
+  <div class="stat"><b style="color:#8338EC">${fullT}</b><span>Full tier</span></div>
   <div class="stat"><b style="color:#555">${naAtiv}</b><span>Não ativadas</span></div>
   <div class="stat"><b style="color:#FF006E">${revog}</b><span>Revogadas</span></div>
   <div class="stat"><b style="color:#FFBE0B">${expir}</b><span>Expiradas</span></div>
@@ -533,6 +570,10 @@ tr:hover{filter:brightness(1.2)}
     <input type="hidden" name="token" value="${token}"/>
     <input name="note" placeholder="Nome do cliente" style="width:200px"/>
     <input name="days" type="number" value="30" style="width:70px"/> dias
+    <select name="tier">
+      <option value="basic">basic (só LiveMacro)</option>
+      <option value="full">full (+ Arena PvP)</option>
+    </select>
     <input name="key" placeholder="TTLM-XXXX-XXXX-XXXX (deixe vazio pra gerar)" style="width:230px"/>
     <button type="submit">Criar Chave</button>
   </form>
@@ -541,8 +582,8 @@ tr:hover{filter:brightness(1.2)}
 <div class="card">
   <h3>🔑 Chaves Cadastradas</h3>
   <table>
-    <tr><th>Chave</th><th>Cliente</th><th>Dias</th><th>Status</th><th>Expira</th><th>Máquina</th><th>Ações</th></tr>
-    ${rows || '<tr><td colspan="7" style="text-align:center;color:#555;padding:30px">Nenhuma chave cadastrada</td></tr>'}
+    <tr><th>Chave</th><th>Cliente</th><th>Dias</th><th>Tier</th><th>Status</th><th>Expira</th><th>Máquina</th><th>Ações</th></tr>
+    ${rows || '<tr><td colspan="8" style="text-align:center;color:#555;padding:30px">Nenhuma chave cadastrada</td></tr>'}
   </table>
 </div>
 </body></html>`);
