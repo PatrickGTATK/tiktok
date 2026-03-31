@@ -19,21 +19,44 @@
  * ── TIERS ────────────────────────────────────────────────────
  *   'basic' → LiveMacro Pro apenas
  *   'full'  → LiveMacro Pro + Arena PvP
+ *
+ * ── CERTIFICADO OFFLINE ───────────────────────────────────────
+ *   Em cada /activate e /verify bem-sucedidos, o servidor retorna
+ *   um campo `offlineCert` — um objeto JSON assinado com Ed25519
+ *   contendo {key, machineId, tier, expiresAt, offlineValidUntil}.
+ *
+ *   O cliente armazena esse cert localmente. Quando offline, verifica
+ *   a assinatura Ed25519 localmente (chave pública no cliente) e usa
+ *   os dados do cert sem precisar de segredo local.
+ *
+ *   Como a chave privada fica APENAS aqui, ninguém pode forjar um
+ *   cert válido — mesmo extraindo o license.dat ou o processo em memória.
  */
 
 const express  = require('express');
 const crypto   = require('crypto');
 const { Pool } = require('pg');
 
-const app  = express();
+const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// ── EXTRATOR DE COOKIE (sem dependência externa) ───────────────────
+function getAdminToken(req) {
+  const cookie = req.headers.cookie || '';
+  const match  = cookie.match(/(?:^|;\s*)adminToken=([^;]+)/);
+  return match ? match[1] : null;
+}
+
 const PORT              = process.env.PORT              || 3000;
-const ADMIN_SECRET      = process.env.ADMIN_SECRET      || 'troque-esta-senha';
+const ADMIN_SECRET      = process.env.ADMIN_SECRET;
 const SIGNING_PRIVATE_KEY = process.env.SIGNING_PRIVATE_KEY || null;
 const DATABASE_URL      = process.env.DATABASE_URL;
 
+// Período de graça offline: 1 dia (mesmo valor do licenseManager)
+const GRACE_PERIOD_MS = 1 * 24 * 60 * 60 * 1000;
+
+// ── VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS ───────────────────────────
 if (!DATABASE_URL) {
   console.error('❌ DATABASE_URL não configurado!');
   process.exit(1);
@@ -44,11 +67,17 @@ if (!SIGNING_PRIVATE_KEY) {
   process.exit(1);
 }
 
+// Bloqueia inicialização se ADMIN_SECRET não estiver configurado ou for o valor padrão
+if (!ADMIN_SECRET || ADMIN_SECRET === 'troque-esta-senha') {
+  console.error('❌ ADMIN_SECRET não configurado ou ainda com valor padrão!');
+  console.error('   Defina uma senha forte na variável de ambiente ADMIN_SECRET no Railway.');
+  process.exit(1);
+}
+
 // Valida que a chave privada carrega corretamente na inicialização
 let privateKeyObject;
 try {
   privateKeyObject = crypto.createPrivateKey(SIGNING_PRIVATE_KEY);
-  // Teste rápido de assinatura para garantir que funciona
   crypto.sign(null, Buffer.from('teste'), privateKeyObject);
   console.log('[CRYPTO] ✅ Chave privada Ed25519 carregada com sucesso.');
 } catch (e) {
@@ -63,7 +92,6 @@ const pool = new Pool({
 });
 
 async function initDB() {
-  // Cria tabela se não existir (com coluna tier desde o início)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS licenses (
       key          TEXT PRIMARY KEY,
@@ -78,7 +106,6 @@ async function initDB() {
     )
   `);
 
-  // Migração segura: adiciona coluna tier se a tabela já existia sem ela
   await pool.query(`
     ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'basic'
   `);
@@ -86,13 +113,11 @@ async function initDB() {
   console.log('[DB] ✅ Tabela de licenças pronta.');
 }
 
-// ── ED25519 — ASSINAR RESPOSTA ────────────────────────────────────
-// A chave privada fica APENAS aqui. O cliente só tem a chave pública
-// e pode verificar a assinatura, mas NUNCA forjá-la.
+// ── ED25519 — ASSINAR RESPOSTA ONLINE ─────────────────────────────
+// Inclui _ts para proteção contra replay attack (janela de 30s no cliente).
 function signResponse(payload) {
   const _ts     = Date.now();
   const toSign  = { ...payload, _ts };
-  // Serializa com chaves ordenadas para garantir determinismo
   const message = JSON.stringify(toSign, Object.keys(toSign).sort());
 
   const _sig = crypto
@@ -102,22 +127,46 @@ function signResponse(payload) {
   return { ...toSign, _sig };
 }
 
+// ── ED25519 — GERAR CERTIFICADO OFFLINE ───────────────────────────
+// Assinatura SEM _ts — o cert tem seu próprio campo offlineValidUntil.
+// O cliente verifica a assinatura offline sem precisar de segredo local.
+// Como a chave privada fica APENAS aqui, é impossível forjar um cert válido.
+function generateOfflineCert(key, machineId, tier, expiresAt) {
+  const offlineValidUntil = new Date(Date.now() + GRACE_PERIOD_MS).toISOString();
+
+  const payload = { key, machineId, tier, expiresAt, offlineValidUntil };
+
+  // Serializa com chaves ordenadas — o licenseManager deve reproduzir
+  // EXATAMENTE essa ordem ao verificar
+  const message = Buffer.from(JSON.stringify(payload, Object.keys(payload).sort()));
+
+  const _sig = crypto
+    .sign(null, message, privateKeyObject)
+    .toString('base64');
+
+  return { ...payload, _sig };
+}
+
 // ── HELPERS ───────────────────────────────────────────────────────
 function generateKey() {
   const seg = () => crypto.randomBytes(2).toString('hex').toUpperCase();
   return `TTLM-${seg()}-${seg()}-${seg()}`;
 }
 
-function adminCheck(req, res) {
-  const secret = req.body?.secret;
-  if (!secret || secret !== ADMIN_SECRET) {
-    res.status(403).json({ ok: false, error: 'Acesso negado.' });
-    return false;
-  }
-  return true;
+// Escapa HTML para prevenir XSS no painel admin
+function escapeHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;')
+    .replace(/"/g,  '&quot;')
+    .replace(/'/g,  '&#39;');
 }
 
-// ── SESSÕES ADMIN ─────────────────────────────────────────────────
+// ── SESSÕES ADMIN (cookie HttpOnly) ───────────────────────────────
+// Token NÃO vai mais na URL — fica em cookie HttpOnly; Secure; SameSite=Strict.
+// Isso previne: logs do Railway, histórico do navegador e header Referer
+// expondo o token.
 const adminSessions = new Map();
 
 function createAdminSession() {
@@ -233,8 +282,12 @@ app.post('/activate', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, error: 'Esta chave expirou.', expired: true }));
 
-    // Retorna tier — o cliente usa isso para liberar ou não o Arena PvP
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier: entry.tier || 'basic' }));
+    const tier = entry.tier || 'basic';
+
+    // Gera certificado offline assinado com Ed25519
+    const offlineCert = generateOfflineCert(cleanKey, machineId, tier, entry.expires_at);
+
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier, offlineCert }));
 
   } catch (e) {
     console.error('[ACTIVATE] Erro:', e.message);
@@ -268,10 +321,14 @@ app.post('/verify', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, expired: true, error: 'Licença expirada.' }));
 
-    console.log(`[VERIFY] ✅ ${cleanKey} — tier: ${entry.tier} — máquina ${machineId.slice(0, 8)}...`);
-    // Sempre retorna o tier atual do banco — se você fizer upgrade de uma chave,
-    // o cliente recebe o novo tier automaticamente na próxima verificação.
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier: entry.tier || 'basic' }));
+    const tier = entry.tier || 'basic';
+    console.log(`[VERIFY] ✅ ${cleanKey} — tier: ${tier} — máquina ${machineId.slice(0, 8)}...`);
+
+    // Gera certificado offline renovado — janela offline reinicia a cada verify
+    const offlineCert = generateOfflineCert(cleanKey, machineId, tier, entry.expires_at);
+
+    // Sempre retorna o tier atual do banco — upgrades refletem automaticamente
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier, offlineCert }));
 
   } catch (e) {
     console.error('[VERIFY] Erro:', e.message);
@@ -286,67 +343,72 @@ app.post('/admin/login', (req, res) => {
   const secret = req.body?.secret;
   if (!secret || secret !== ADMIN_SECRET) {
     console.warn(`[ADMIN] ❌ Login inválido — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
-    return res.status(403).send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Admin — TTLM</title>
-<style>*{box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-.box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:320px;text-align:center}
-h2{color:#FF006E;margin-bottom:16px}p{color:#666;font-size:13px;margin-bottom:20px}
-input{background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14px;border-radius:8px;width:100%;margin-bottom:12px;font-size:14px}
-button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;width:100%}
-.err{color:#FF006E;font-size:13px;margin-bottom:12px}</style></head><body>
-<div class="box"><h2>⚡ TTLM Admin</h2>
-<div class="err">❌ Senha incorreta</div>
-<form method="POST" action="/admin/login">
-<input type="password" name="secret" placeholder="Senha admin" autofocus/>
-<button type="submit">Entrar</button>
-</form></div></body></html>`);
+    return res.status(403).send(buildLoginPage('❌ Senha incorreta'));
   }
 
   const token = createAdminSession();
   console.log(`[ADMIN] ✅ Login — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
-  return res.redirect(`/admin?token=${token}`);
+
+  // Token vai em cookie HttpOnly — não aparece em URL, logs ou Referer
+  res.cookie('adminToken', token, {
+    httpOnly: true,
+    secure:   true,
+    sameSite: 'Strict',
+    maxAge:   3_600_000,
+  });
+
+  return res.redirect('/admin');
 });
 
-// ── MIDDLEWARE: verificar sessão admin ────────────────────────────
-function adminSessionCheck(req, res) {
-  const token = req.query?.token || req.body?.token;
-  if (!validateAdminSession(token)) return res.redirect('/admin/login-page');
-  return token;
-}
-
-// Página de login
-app.get('/admin/login-page', (req, res) => {
-  res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
+// ── PÁGINA DE LOGIN ───────────────────────────────────────────────
+function buildLoginPage(errorMsg = '') {
+  const errHtml = errorMsg
+    ? `<div class="err">${escapeHtml(errorMsg)}</div>`
+    : '';
+  return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>Admin — TTLM</title>
 <style>*{box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:320px;text-align:center}
 h2{color:#FFBE0B;margin-bottom:16px}p{color:#666;font-size:13px;margin-bottom:20px}
 input{background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14px;border-radius:8px;width:100%;margin-bottom:12px;font-size:14px}
 button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;width:100%}
+.err{color:#FF006E;font-size:13px;margin-bottom:12px}
 </style></head><body>
 <div class="box"><h2>⚡ TTLM Admin</h2>
-<p>Faça login para acessar o painel</p>
+${errHtml}
 <form method="POST" action="/admin/login">
 <input type="password" name="secret" placeholder="Senha admin" autofocus/>
 <button type="submit">Entrar</button>
-</form></div></body></html>`);
+</form></div></body></html>`;
+}
+
+app.get('/admin/login-page', (req, res) => {
+  res.send(buildLoginPage());
 });
 
-// Redireciona /admin sem token para o login
+// ── MIDDLEWARE: verificar sessão admin via cookie ──────────────────
+function adminSessionCheck(req, res) {
+  const token = getAdminToken(req);
+  if (!validateAdminSession(token)) {
+    res.redirect('/admin/login-page');
+    return null;
+  }
+  return token;
+}
+
+// Redireciona /admin sem sessão para o login
 app.get('/admin', (req, res, next) => {
-  const token = req.query?.token;
-  if (!validateAdminSession(token)) return res.redirect('/admin/login-page');
+  if (!validateAdminSession(getAdminToken(req))) return res.redirect('/admin/login-page');
   next();
 });
 
 // ── ADMIN: CRIAR CHAVE ────────────────────────────────────────────
 app.post('/admin/create-key', async (req, res) => {
-  const token = adminSessionCheck(req, res);
-  if (!token) return;
+  if (!adminSessionCheck(req, res)) return;
 
   const { days = 30, note = '', key: customKey, tier = 'basic' } = req.body;
-  const newKey     = customKey ? customKey.trim().toUpperCase() : generateKey();
-  const validTier  = ['basic', 'full'].includes(tier) ? tier : 'basic';
+  const newKey    = customKey ? customKey.trim().toUpperCase() : generateKey();
+  const validTier = ['basic', 'full'].includes(tier) ? tier : 'basic';
 
   try {
     const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [newKey]);
@@ -362,7 +424,7 @@ app.post('/admin/create-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?token=${token}`);
+      return res.redirect('/admin');
 
     return res.json({ ok: true, key: newKey, days: parseInt(days) || 30, tier: validTier });
 
@@ -374,8 +436,7 @@ app.post('/admin/create-key', async (req, res) => {
 
 // ── ADMIN: REVOGAR CHAVE ──────────────────────────────────────────
 app.post('/admin/revoke-key', async (req, res) => {
-  const token = adminSessionCheck(req, res);
-  if (!token) return;
+  if (!adminSessionCheck(req, res)) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
 
@@ -388,7 +449,7 @@ app.post('/admin/revoke-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?token=${token}`);
+      return res.redirect('/admin');
 
     return res.json({ ok: true });
 
@@ -399,8 +460,7 @@ app.post('/admin/revoke-key', async (req, res) => {
 
 // ── ADMIN: EXTENDER DIAS ──────────────────────────────────────────
 app.post('/admin/extend-key', async (req, res) => {
-  const token = adminSessionCheck(req, res);
-  if (!token) return;
+  if (!adminSessionCheck(req, res)) return;
 
   const cleanKey  = (req.body.key || '').trim().toUpperCase();
   const extraDays = parseInt(req.body.days) || 30;
@@ -422,7 +482,7 @@ app.post('/admin/extend-key', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?token=${token}`);
+      return res.redirect('/admin');
 
     return res.json({ ok: true, expiresAt: base.toISOString() });
 
@@ -433,8 +493,7 @@ app.post('/admin/extend-key', async (req, res) => {
 
 // ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
 app.post('/admin/reset-machine', async (req, res) => {
-  const token = adminSessionCheck(req, res);
-  if (!token) return;
+  if (!adminSessionCheck(req, res)) return;
 
   const cleanKey = (req.body.key || '').trim().toUpperCase();
 
@@ -451,7 +510,7 @@ app.post('/admin/reset-machine', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?token=${token}`);
+      return res.redirect('/admin');
 
     return res.json({ ok: true });
 
@@ -462,11 +521,10 @@ app.post('/admin/reset-machine', async (req, res) => {
 
 // ── ADMIN: ALTERAR TIER ───────────────────────────────────────────
 app.post('/admin/set-tier', async (req, res) => {
-  const token = adminSessionCheck(req, res);
-  if (!token) return;
+  if (!adminSessionCheck(req, res)) return;
 
-  const cleanKey  = (req.body.key  || '').trim().toUpperCase();
-  const newTier   = ['basic', 'full'].includes(req.body.tier) ? req.body.tier : 'basic';
+  const cleanKey = (req.body.key  || '').trim().toUpperCase();
+  const newTier  = ['basic', 'full'].includes(req.body.tier) ? req.body.tier : 'basic';
 
   try {
     const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
@@ -477,7 +535,7 @@ app.post('/admin/set-tier', async (req, res) => {
 
     const accept = req.headers['accept'] || '';
     if (accept.includes('text/html'))
-      return res.redirect(`/admin?token=${token}`);
+      return res.redirect('/admin');
 
     return res.json({ ok: true, tier: newTier });
 
@@ -487,9 +545,8 @@ app.post('/admin/set-tier', async (req, res) => {
 });
 
 // ── ADMIN: PAINEL HTML ────────────────────────────────────────────
+// Token removido de todos os forms — autenticação agora via cookie.
 app.get('/admin', async (req, res) => {
-  const token = req.query?.token;
-
   try {
     const { rows: keys } = await pool.query('SELECT * FROM licenses ORDER BY created_at DESC');
     const now = new Date();
@@ -503,24 +560,27 @@ app.get('/admin', async (req, res) => {
         ? '<span style="background:#8338EC;color:#fff;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700">FULL</span>'
         : '<span style="background:#333;color:#aaa;padding:1px 7px;border-radius:10px;font-size:10px">basic</span>';
 
+      // escapeHtml em todos os campos vindos do banco
+      const safeKey  = escapeHtml(k.key);
+      const safeNote = escapeHtml(k.note);
+      const safeMid  = k.machine_id ? escapeHtml(k.machine_id.slice(0, 8)) + '...' : '—';
+
       return `<tr style="background:${rowColor}">
-        <td style="font-family:monospace;font-size:13px">${k.key}</td>
-        <td>${k.note || '—'}</td>
+        <td style="font-family:monospace;font-size:13px">${safeKey}</td>
+        <td>${safeNote || '—'}</td>
         <td style="text-align:center">${k.days}d</td>
         <td style="text-align:center">${tierBadge}</td>
         <td>${status}</td>
         <td style="text-align:center">${exp}</td>
-        <td style="font-family:monospace;font-size:11px">${k.machine_id ? k.machine_id.slice(0,8)+'...' : '—'}</td>
+        <td style="font-family:monospace;font-size:11px">${safeMid}</td>
         <td>
           <form method="POST" action="/admin/extend-key" style="display:inline">
-            <input type="hidden" name="token" value="${token}"/>
-            <input type="hidden" name="key" value="${k.key}"/>
+            <input type="hidden" name="key" value="${safeKey}"/>
             <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
             <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
           </form>
           <form method="POST" action="/admin/set-tier" style="display:inline;margin-left:4px">
-            <input type="hidden" name="token" value="${token}"/>
-            <input type="hidden" name="key" value="${k.key}"/>
+            <input type="hidden" name="key" value="${safeKey}"/>
             <select name="tier" style="background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px;font-size:11px">
               <option value="basic" ${k.tier === 'basic' ? 'selected' : ''}>basic</option>
               <option value="full"  ${k.tier === 'full'  ? 'selected' : ''}>full</option>
@@ -528,13 +588,11 @@ app.get('/admin', async (req, res) => {
             <button type="submit" style="background:#8338EC;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">tier</button>
           </form>
           <form method="POST" action="/admin/reset-machine" style="display:inline;margin-left:4px">
-            <input type="hidden" name="token" value="${token}"/>
-            <input type="hidden" name="key" value="${k.key}"/>
+            <input type="hidden" name="key" value="${safeKey}"/>
             <button type="submit" style="background:#FFBE0B;color:#000;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">reset PC</button>
           </form>
-          <form method="POST" action="/admin/revoke-key" style="display:inline;margin-left:4px" onsubmit="return confirm('Revogar ${k.key}?')">
-            <input type="hidden" name="token" value="${token}"/>
-            <input type="hidden" name="key" value="${k.key}"/>
+          <form method="POST" action="/admin/revoke-key" style="display:inline;margin-left:4px" onsubmit="return confirm('Revogar ${safeKey}?')">
+            <input type="hidden" name="key" value="${safeKey}"/>
             <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">revogar</button>
           </form>
         </td>
@@ -572,7 +630,7 @@ tr:hover{filter:brightness(1.2)}
 </style></head><body>
 <h1>⚡ TikTok Live Macro</h1>
 <div class="sub">Painel de Licenças · ${new Date().toLocaleString('pt-BR')}</div>
-<div class="crypto-badge">🔐 Assinatura Ed25519 ativa — chave privada segura no servidor</div>
+<div class="crypto-badge">🔐 Ed25519 ativo · Certificado offline assinado · Sessão via cookie HttpOnly</div>
 
 <div class="stats">
   <div class="stat"><b>${total}</b><span>Total</span></div>
@@ -586,7 +644,6 @@ tr:hover{filter:brightness(1.2)}
 <div class="card">
   <h3>➕ Criar Nova Chave</h3>
   <form method="POST" action="/admin/create-key">
-    <input type="hidden" name="token" value="${token}"/>
     <input name="note" placeholder="Nome do cliente" style="width:200px"/>
     <input name="days" type="number" value="30" style="width:70px"/> dias
     <select name="tier" style="margin-right:6px">
@@ -614,24 +671,27 @@ tr:hover{filter:brightness(1.2)}
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────
+// Removida a contagem de chaves — informação desnecessária pública.
 app.get('/', async (req, res) => {
   try {
-    const { rows } = await pool.query('SELECT COUNT(*) FROM licenses');
-    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', keys: parseInt(rows[0].count) });
+    await pool.query('SELECT 1');
+    res.json({ status: 'ok', service: 'TTLM License Server v5 (Ed25519 + OfflineCert)' });
   } catch {
-    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', db: 'conectando...' });
+    res.json({ status: 'degraded', service: 'TTLM License Server v5', db: 'reconectando...' });
   }
 });
 
 // ── INICIAR ───────────────────────────────────────────────────────
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n══════════════════════════════════════`);
-    console.log(`   TTLM License Server v4 (Ed25519)`);
-    console.log(`   Porta: ${PORT}`);
-    console.log(`   Admin: /admin/login-page`);
-    console.log(`   Criptografia: Ed25519 ✅`);
-    console.log(`══════════════════════════════════════\n`);
+    console.log(`\n══════════════════════════════════════════════`);
+    console.log(`   TTLM License Server v5`);
+    console.log(`   Porta       : ${PORT}`);
+    console.log(`   Admin       : /admin`);
+    console.log(`   Ed25519     : ✅`);
+    console.log(`   OfflineCert : ✅`);
+    console.log(`   Cookie Auth : ✅`);
+    console.log(`══════════════════════════════════════════════\n`);
   });
 }).catch(e => {
   console.error('❌ Erro ao conectar no banco:', e.message);
