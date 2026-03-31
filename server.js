@@ -20,43 +20,42 @@
  *   'basic' → LiveMacro Pro apenas
  *   'full'  → LiveMacro Pro + Arena PvP
  *
- * ── CERTIFICADO OFFLINE ───────────────────────────────────────
- *   Em cada /activate e /verify bem-sucedidos, o servidor retorna
- *   um campo `offlineCert` — um objeto JSON assinado com Ed25519
- *   contendo {key, machineId, tier, expiresAt, offlineValidUntil}.
+ * ── CORREÇÕES DE SEGURANÇA (v2) ──────────────────────────────────
+ *  [FIX-1] Token admin via cookie HttpOnly — não mais exposto na URL
+ *  [FIX-2] Escape de HTML em todo output do painel (previne XSS)
+ *  [FIX-5] ADMIN_SECRET sem valor padrão — bloqueia deploy esquecido
+ *  [FIX-6] Limite de tamanho nos inputs (10kb body, campos truncados)
+ *  [FIX-6] Validação de range em 'days' (1–365)
  *
- *   O cliente armazena esse cert localmente. Quando offline, verifica
- *   a assinatura Ed25519 localmente (chave pública no cliente) e usa
- *   os dados do cert sem precisar de segredo local.
- *
- *   Como a chave privada fica APENAS aqui, ninguém pode forjar um
- *   cert válido — mesmo extraindo o license.dat ou o processo em memória.
+ * ── DEPENDÊNCIA ADICIONAL ─────────────────────────────────────
+ *   npm install cookie-parser
  */
 
-const express  = require('express');
-const crypto   = require('crypto');
-const { Pool } = require('pg');
+const express      = require('express');
+const cookieParser = require('cookie-parser');
+const crypto       = require('crypto');
+const { Pool }     = require('pg');
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-// ── EXTRATOR DE COOKIE (sem dependência externa) ───────────────────
-function getAdminToken(req) {
-  const cookie = req.headers.cookie || '';
-  const match  = cookie.match(/(?:^|;\s*)adminToken=([^;]+)/);
-  return match ? match[1] : null;
+// [FIX-6] Limite de 10kb no body — previne flood e ataques de memória
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+app.use(cookieParser());
+
+const PORT               = process.env.PORT               || 3000;
+const SIGNING_PRIVATE_KEY = process.env.SIGNING_PRIVATE_KEY || null;
+const DATABASE_URL        = process.env.DATABASE_URL;
+
+// [FIX-5] ADMIN_SECRET obrigatório e sem valor padrão.
+// O servidor recusa a iniciar se não estiver configurado corretamente.
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+if (!ADMIN_SECRET || ADMIN_SECRET.trim().length < 12) {
+  console.error('❌ ADMIN_SECRET não configurado ou muito curto (mínimo 12 caracteres)!');
+  console.error('   Configure a variável de ambiente ADMIN_SECRET no Railway.');
+  process.exit(1);
 }
 
-const PORT              = process.env.PORT              || 3000;
-const ADMIN_SECRET      = process.env.ADMIN_SECRET;
-const SIGNING_PRIVATE_KEY = process.env.SIGNING_PRIVATE_KEY || null;
-const DATABASE_URL      = process.env.DATABASE_URL;
-
-// Período de graça offline: 1 dia (mesmo valor do licenseManager)
-const GRACE_PERIOD_MS = 1 * 24 * 60 * 60 * 1000;
-
-// ── VALIDAÇÃO DE VARIÁVEIS OBRIGATÓRIAS ───────────────────────────
 if (!DATABASE_URL) {
   console.error('❌ DATABASE_URL não configurado!');
   process.exit(1);
@@ -67,17 +66,11 @@ if (!SIGNING_PRIVATE_KEY) {
   process.exit(1);
 }
 
-// Bloqueia inicialização se ADMIN_SECRET não estiver configurado ou for o valor padrão
-if (!ADMIN_SECRET || ADMIN_SECRET === 'troque-esta-senha') {
-  console.error('❌ ADMIN_SECRET não configurado ou ainda com valor padrão!');
-  console.error('   Defina uma senha forte na variável de ambiente ADMIN_SECRET no Railway.');
-  process.exit(1);
-}
-
 // Valida que a chave privada carrega corretamente na inicialização
 let privateKeyObject;
 try {
   privateKeyObject = crypto.createPrivateKey(SIGNING_PRIVATE_KEY);
+  // Teste rápido de assinatura para garantir que funciona
   crypto.sign(null, Buffer.from('teste'), privateKeyObject);
   console.log('[CRYPTO] ✅ Chave privada Ed25519 carregada com sucesso.');
 } catch (e) {
@@ -92,6 +85,7 @@ const pool = new Pool({
 });
 
 async function initDB() {
+  // Cria tabela se não existir (com coluna tier desde o início)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS licenses (
       key          TEXT PRIMARY KEY,
@@ -106,6 +100,7 @@ async function initDB() {
     )
   `);
 
+  // Migração segura: adiciona coluna tier se a tabela já existia sem ela
   await pool.query(`
     ALTER TABLE licenses ADD COLUMN IF NOT EXISTS tier TEXT NOT NULL DEFAULT 'basic'
   `);
@@ -113,11 +108,13 @@ async function initDB() {
   console.log('[DB] ✅ Tabela de licenças pronta.');
 }
 
-// ── ED25519 — ASSINAR RESPOSTA ONLINE ─────────────────────────────
-// Inclui _ts para proteção contra replay attack (janela de 30s no cliente).
+// ── ED25519 — ASSINAR RESPOSTA ────────────────────────────────────
+// A chave privada fica APENAS aqui. O cliente só tem a chave pública
+// e pode verificar a assinatura, mas NUNCA forjá-la.
 function signResponse(payload) {
   const _ts     = Date.now();
   const toSign  = { ...payload, _ts };
+  // Serializa com chaves ordenadas para garantir determinismo
   const message = JSON.stringify(toSign, Object.keys(toSign).sort());
 
   const _sig = crypto
@@ -127,24 +124,17 @@ function signResponse(payload) {
   return { ...toSign, _sig };
 }
 
-// ── ED25519 — GERAR CERTIFICADO OFFLINE ───────────────────────────
-// Assinatura SEM _ts — o cert tem seu próprio campo offlineValidUntil.
-// O cliente verifica a assinatura offline sem precisar de segredo local.
-// Como a chave privada fica APENAS aqui, é impossível forjar um cert válido.
-function generateOfflineCert(key, machineId, tier, expiresAt) {
-  const offlineValidUntil = new Date(Date.now() + GRACE_PERIOD_MS).toISOString();
-
-  const payload = { key, machineId, tier, expiresAt, offlineValidUntil };
-
-  // Serializa com chaves ordenadas — o licenseManager deve reproduzir
-  // EXATAMENTE essa ordem ao verificar
-  const message = Buffer.from(JSON.stringify(payload, Object.keys(payload).sort()));
-
-  const _sig = crypto
-    .sign(null, message, privateKeyObject)
-    .toString('base64');
-
-  return { ...payload, _sig };
+// ── [FIX-2] ESCAPE DE HTML ────────────────────────────────────────
+// Aplica em TODO output dinâmico do painel para prevenir XSS armazenado.
+// Um atacante que criar chave com note='<script>...</script>' não consegue
+// executar código no browser do admin.
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g,  '&amp;')
+    .replace(/</g,  '&lt;')
+    .replace(/>/g,  '&gt;')
+    .replace(/"/g,  '&quot;')
+    .replace(/'/g,  '&#039;');
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────
@@ -153,20 +143,7 @@ function generateKey() {
   return `TTLM-${seg()}-${seg()}-${seg()}`;
 }
 
-// Escapa HTML para prevenir XSS no painel admin
-function escapeHtml(str) {
-  return String(str == null ? '' : str)
-    .replace(/&/g,  '&amp;')
-    .replace(/</g,  '&lt;')
-    .replace(/>/g,  '&gt;')
-    .replace(/"/g,  '&quot;')
-    .replace(/'/g,  '&#39;');
-}
-
-// ── SESSÕES ADMIN (cookie HttpOnly) ───────────────────────────────
-// Token NÃO vai mais na URL — fica em cookie HttpOnly; Secure; SameSite=Strict.
-// Isso previne: logs do Railway, histórico do navegador e header Referer
-// expondo o token.
+// ── SESSÕES ADMIN ─────────────────────────────────────────────────
 const adminSessions = new Map();
 
 function createAdminSession() {
@@ -244,8 +221,9 @@ setInterval(() => {
 
 // ── ROTA: ATIVAR (/activate) ──────────────────────────────────────
 app.post('/activate', async (req, res) => {
-  const { key, machineId } = req.body || {};
-  const cleanKey = (key || '').trim().toUpperCase();
+  // [FIX-6] Trunca inputs para evitar payloads abusivos
+  const cleanKey   = ((req.body?.key  || '').trim().toUpperCase()).slice(0, 32);
+  const machineId  = ((req.body?.machineId || '')).slice(0, 64);
 
   if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
 
@@ -282,12 +260,8 @@ app.post('/activate', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, error: 'Esta chave expirou.', expired: true }));
 
-    const tier = entry.tier || 'basic';
-
-    // Gera certificado offline assinado com Ed25519
-    const offlineCert = generateOfflineCert(cleanKey, machineId, tier, entry.expires_at);
-
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier, offlineCert }));
+    // Retorna tier — o cliente usa isso para liberar ou não o Arena PvP
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier: entry.tier || 'basic' }));
 
   } catch (e) {
     console.error('[ACTIVATE] Erro:', e.message);
@@ -297,8 +271,9 @@ app.post('/activate', async (req, res) => {
 
 // ── ROTA: VERIFICAR (/verify) ─────────────────────────────────────
 app.post('/verify', async (req, res) => {
-  const { key, machineId } = req.body || {};
-  const cleanKey = (key || '').trim().toUpperCase();
+  // [FIX-6] Trunca inputs para evitar payloads abusivos
+  const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
+  const machineId = ((req.body?.machineId || '')).slice(0, 64);
 
   if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
 
@@ -321,14 +296,10 @@ app.post('/verify', async (req, res) => {
     if (new Date() > new Date(entry.expires_at))
       return res.json(signResponse({ ok: false, expired: true, error: 'Licença expirada.' }));
 
-    const tier = entry.tier || 'basic';
-    console.log(`[VERIFY] ✅ ${cleanKey} — tier: ${tier} — máquina ${machineId.slice(0, 8)}...`);
-
-    // Gera certificado offline renovado — janela offline reinicia a cada verify
-    const offlineCert = generateOfflineCert(cleanKey, machineId, tier, entry.expires_at);
-
-    // Sempre retorna o tier atual do banco — upgrades refletem automaticamente
-    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier, offlineCert }));
+    console.log(`[VERIFY] ✅ ${cleanKey} — tier: ${entry.tier} — máquina ${machineId.slice(0, 8)}...`);
+    // Sempre retorna o tier atual do banco — se você fizer upgrade de uma chave,
+    // o cliente recebe o novo tier automaticamente na próxima verificação.
+    return res.json(signResponse({ ok: true, expiresAt: entry.expires_at, tier: entry.tier || 'basic' }));
 
   } catch (e) {
     console.error('[VERIFY] Erro:', e.message);
@@ -337,31 +308,50 @@ app.post('/verify', async (req, res) => {
 });
 
 // ── ADMIN: LOGIN ──────────────────────────────────────────────────
+// [FIX-1] Token agora vai como cookie HttpOnly/Secure — nunca aparece
+//         na URL, em logs do servidor, ou no header Referer.
 app.post('/admin/login', (req, res) => {
   if (!rateLimit(req, res, RATE_MAX_ADMIN)) return;
 
   const secret = req.body?.secret;
   if (!secret || secret !== ADMIN_SECRET) {
     console.warn(`[ADMIN] ❌ Login inválido — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
-    return res.status(403).send(buildLoginPage('❌ Senha incorreta'));
+    return res.status(403).send(renderLoginPage('❌ Senha incorreta'));
   }
 
   const token = createAdminSession();
   console.log(`[ADMIN] ✅ Login — IP: ${req.headers['x-forwarded-for'] || req.socket.remoteAddress}`);
 
-  // Token vai em cookie HttpOnly — não aparece em URL, logs ou Referer
-  res.cookie('adminToken', token, {
+  // [FIX-1] Cookie HttpOnly + Secure + SameSite=Strict
+  // HttpOnly  → JavaScript da página não consegue ler o token
+  // Secure    → só enviado em HTTPS (Railway sempre usa HTTPS)
+  // SameSite  → bloqueia CSRF — cookie não é enviado de outros domínios
+  res.cookie('adm_session', token, {
     httpOnly: true,
     secure:   true,
     sameSite: 'Strict',
-    maxAge:   3_600_000,
+    maxAge:   3_600_000, // 1 hora em ms
   });
 
   return res.redirect('/admin');
 });
 
-// ── PÁGINA DE LOGIN ───────────────────────────────────────────────
-function buildLoginPage(errorMsg = '') {
+// ── MIDDLEWARE: verificar sessão admin ────────────────────────────
+// [FIX-1] Lê token do cookie (não mais da URL ou do body)
+function requireAdminSession(req, res, next) {
+  const token = req.cookies?.adm_session;
+  if (!validateAdminSession(token)) {
+    return res.redirect('/admin/login-page');
+  }
+  next();
+}
+
+// Página de login
+app.get('/admin/login-page', (req, res) => {
+  res.send(renderLoginPage());
+});
+
+function renderLoginPage(errorMsg = '') {
   const errHtml = errorMsg
     ? `<div class="err">${escapeHtml(errorMsg)}</div>`
     : '';
@@ -375,6 +365,7 @@ button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none
 .err{color:#FF006E;font-size:13px;margin-bottom:12px}
 </style></head><body>
 <div class="box"><h2>⚡ TTLM Admin</h2>
+<p>Faça login para acessar o painel</p>
 ${errHtml}
 <form method="POST" action="/admin/login">
 <input type="password" name="secret" placeholder="Senha admin" autofocus/>
@@ -382,201 +373,39 @@ ${errHtml}
 </form></div></body></html>`;
 }
 
-app.get('/admin/login-page', (req, res) => {
-  res.send(buildLoginPage());
-});
-
-// ── MIDDLEWARE: verificar sessão admin via cookie ──────────────────
-function adminSessionCheck(req, res) {
-  const token = getAdminToken(req);
-  if (!validateAdminSession(token)) {
-    res.redirect('/admin/login-page');
-    return null;
-  }
-  return token;
-}
-
-// Redireciona /admin sem sessão para o login
-app.get('/admin', (req, res, next) => {
-  if (!validateAdminSession(getAdminToken(req))) return res.redirect('/admin/login-page');
-  next();
-});
-
-// ── ADMIN: CRIAR CHAVE ────────────────────────────────────────────
-app.post('/admin/create-key', async (req, res) => {
-  if (!adminSessionCheck(req, res)) return;
-
-  const { days = 30, note = '', key: customKey, tier = 'basic' } = req.body;
-  const newKey    = customKey ? customKey.trim().toUpperCase() : generateKey();
-  const validTier = ['basic', 'full'].includes(tier) ? tier : 'basic';
-
-  try {
-    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [newKey]);
-    if (rows.length > 0)
-      return res.json({ ok: false, error: 'Chave já existe.' });
-
-    await pool.query(
-      'INSERT INTO licenses (key, days, note, tier) VALUES ($1, $2, $3, $4)',
-      [newKey, parseInt(days) || 30, note, validTier]
-    );
-
-    console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days}d — tier: ${validTier}) — ${note}`);
-
-    const accept = req.headers['accept'] || '';
-    if (accept.includes('text/html'))
-      return res.redirect('/admin');
-
-    return res.json({ ok: true, key: newKey, days: parseInt(days) || 30, tier: validTier });
-
-  } catch (e) {
-    console.error('[CREATE-KEY] Erro:', e.message);
-    return res.json({ ok: false, error: 'Erro interno.' });
-  }
-});
-
-// ── ADMIN: REVOGAR CHAVE ──────────────────────────────────────────
-app.post('/admin/revoke-key', async (req, res) => {
-  if (!adminSessionCheck(req, res)) return;
-
-  const cleanKey = (req.body.key || '').trim().toUpperCase();
-
-  try {
-    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
-    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
-
-    await pool.query('UPDATE licenses SET revoked = TRUE WHERE key = $1', [cleanKey]);
-    console.log(`[ADMIN] 🚫 Revogada: ${cleanKey}`);
-
-    const accept = req.headers['accept'] || '';
-    if (accept.includes('text/html'))
-      return res.redirect('/admin');
-
-    return res.json({ ok: true });
-
-  } catch (e) {
-    return res.json({ ok: false, error: 'Erro interno.' });
-  }
-});
-
-// ── ADMIN: EXTENDER DIAS ──────────────────────────────────────────
-app.post('/admin/extend-key', async (req, res) => {
-  if (!adminSessionCheck(req, res)) return;
-
-  const cleanKey  = (req.body.key || '').trim().toUpperCase();
-  const extraDays = parseInt(req.body.days) || 30;
-
-  try {
-    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
-    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
-
-    const entry = rows[0];
-    const base  = entry.expires_at ? new Date(entry.expires_at) : new Date();
-    base.setDate(base.getDate() + extraDays);
-
-    await pool.query(
-      'UPDATE licenses SET expires_at = $1, revoked = FALSE WHERE key = $2',
-      [base.toISOString(), cleanKey]
-    );
-
-    console.log(`[ADMIN] ➕ ${cleanKey} +${extraDays}d → expira ${base.toISOString()}`);
-
-    const accept = req.headers['accept'] || '';
-    if (accept.includes('text/html'))
-      return res.redirect('/admin');
-
-    return res.json({ ok: true, expiresAt: base.toISOString() });
-
-  } catch (e) {
-    return res.json({ ok: false, error: 'Erro interno.' });
-  }
-});
-
-// ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
-app.post('/admin/reset-machine', async (req, res) => {
-  if (!adminSessionCheck(req, res)) return;
-
-  const cleanKey = (req.body.key || '').trim().toUpperCase();
-
-  try {
-    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
-    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
-
-    await pool.query(
-      'UPDATE licenses SET machine_id = NULL, activated_at = NULL, expires_at = NULL WHERE key = $1',
-      [cleanKey]
-    );
-
-    console.log(`[ADMIN] 🔄 Máquina resetada: ${cleanKey}`);
-
-    const accept = req.headers['accept'] || '';
-    if (accept.includes('text/html'))
-      return res.redirect('/admin');
-
-    return res.json({ ok: true });
-
-  } catch (e) {
-    return res.json({ ok: false, error: 'Erro interno.' });
-  }
-});
-
-// ── ADMIN: ALTERAR TIER ───────────────────────────────────────────
-app.post('/admin/set-tier', async (req, res) => {
-  if (!adminSessionCheck(req, res)) return;
-
-  const cleanKey = (req.body.key  || '').trim().toUpperCase();
-  const newTier  = ['basic', 'full'].includes(req.body.tier) ? req.body.tier : 'basic';
-
-  try {
-    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
-    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
-
-    await pool.query('UPDATE licenses SET tier = $1 WHERE key = $2', [newTier, cleanKey]);
-    console.log(`[ADMIN] 🔄 Tier de ${cleanKey} → ${newTier}`);
-
-    const accept = req.headers['accept'] || '';
-    if (accept.includes('text/html'))
-      return res.redirect('/admin');
-
-    return res.json({ ok: true, tier: newTier });
-
-  } catch (e) {
-    return res.json({ ok: false, error: 'Erro interno.' });
-  }
-});
-
-// ── ADMIN: PAINEL HTML ────────────────────────────────────────────
-// Token removido de todos os forms — autenticação agora via cookie.
-app.get('/admin', async (req, res) => {
+// Redireciona /admin sem sessão válida para o login
+app.get('/admin', requireAdminSession, async (req, res) => {
   try {
     const { rows: keys } = await pool.query('SELECT * FROM licenses ORDER BY created_at DESC');
     const now = new Date();
 
     const rows = keys.map(k => {
-      const exp      = k.expires_at ? new Date(k.expires_at).toLocaleDateString('pt-BR') : '—';
-      const active   = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
-      const status   = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
-      const rowColor = k.revoked ? '#2a1a1a' : !k.activated_at ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
+      const exp       = k.expires_at ? new Date(k.expires_at).toLocaleDateString('pt-BR') : '—';
+      const active    = k.activated_at && !k.revoked && now < new Date(k.expires_at || 0);
+      const status    = k.revoked ? '🚫 Revogada' : !k.activated_at ? '⏳ Não ativada' : !active ? '❌ Expirada' : '✅ Ativa';
+      const rowColor  = k.revoked ? '#2a1a1a' : !k.activated_at ? '#1a1a2a' : !active ? '#2a1f1a' : '#1a2a1a';
+      // [FIX-2] Escapamos key e note antes de inserir no HTML
+      const safeKey   = escapeHtml(k.key);
+      const safeNote  = escapeHtml(k.note) || '—';
+      const safeMachine = k.machine_id ? escapeHtml(k.machine_id.slice(0, 8)) + '...' : '—';
       const tierBadge = k.tier === 'full'
         ? '<span style="background:#8338EC;color:#fff;padding:1px 7px;border-radius:10px;font-size:10px;font-weight:700">FULL</span>'
         : '<span style="background:#333;color:#aaa;padding:1px 7px;border-radius:10px;font-size:10px">basic</span>';
 
-      // escapeHtml em todos os campos vindos do banco
-      const safeKey  = escapeHtml(k.key);
-      const safeNote = escapeHtml(k.note);
-      const safeMid  = k.machine_id ? escapeHtml(k.machine_id.slice(0, 8)) + '...' : '—';
-
+      // [FIX-1] Forms não precisam mais carregar token oculto — autenticação
+      //         é feita automaticamente pelo cookie HttpOnly em cada request.
       return `<tr style="background:${rowColor}">
         <td style="font-family:monospace;font-size:13px">${safeKey}</td>
-        <td>${safeNote || '—'}</td>
+        <td>${safeNote}</td>
         <td style="text-align:center">${k.days}d</td>
         <td style="text-align:center">${tierBadge}</td>
         <td>${status}</td>
         <td style="text-align:center">${exp}</td>
-        <td style="font-family:monospace;font-size:11px">${safeMid}</td>
+        <td style="font-family:monospace;font-size:11px">${safeMachine}</td>
         <td>
           <form method="POST" action="/admin/extend-key" style="display:inline">
             <input type="hidden" name="key" value="${safeKey}"/>
-            <input type="number" name="days" value="30" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
+            <input type="number" name="days" value="30" min="1" max="365" style="width:50px;background:#111;color:#ccc;border:1px solid #333;padding:2px 4px;border-radius:4px"/>
             <button type="submit" style="background:#3A86FF;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px">+dias</button>
           </form>
           <form method="POST" action="/admin/set-tier" style="display:inline;margin-left:4px">
@@ -627,10 +456,11 @@ th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #21262d;font-siz
 th{background:#0d1117;color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
 tr:hover{filter:brightness(1.2)}
 .crypto-badge{background:#0a1f0a;border:1px solid #1a4a1a;color:#06D6A0;padding:6px 14px;border-radius:8px;font-size:11px;font-family:monospace;margin-bottom:20px;display:inline-block}
+.logout{float:right;background:#333;color:#ccc;border:none;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;text-decoration:none}
 </style></head><body>
-<h1>⚡ TikTok Live Macro</h1>
+<h1>⚡ TikTok Live Macro <a href="/admin/logout" class="logout">Sair</a></h1>
 <div class="sub">Painel de Licenças · ${new Date().toLocaleString('pt-BR')}</div>
-<div class="crypto-badge">🔐 Ed25519 ativo · Certificado offline assinado · Sessão via cookie HttpOnly</div>
+<div class="crypto-badge">🔐 Assinatura Ed25519 ativa — chave privada segura no servidor</div>
 
 <div class="stats">
   <div class="stat"><b>${total}</b><span>Total</span></div>
@@ -645,7 +475,7 @@ tr:hover{filter:brightness(1.2)}
   <h3>➕ Criar Nova Chave</h3>
   <form method="POST" action="/admin/create-key">
     <input name="note" placeholder="Nome do cliente" style="width:200px"/>
-    <input name="days" type="number" value="30" style="width:70px"/> dias
+    <input name="days" type="number" value="30" min="1" max="365" style="width:70px"/> dias
     <select name="tier" style="margin-right:6px">
       <option value="basic">basic (LiveMacro Pro)</option>
       <option value="full">full (+ Arena PvP)</option>
@@ -670,28 +500,168 @@ tr:hover{filter:brightness(1.2)}
   }
 });
 
+// ── ADMIN: LOGOUT ─────────────────────────────────────────────────
+app.get('/admin/logout', (req, res) => {
+  const token = req.cookies?.adm_session;
+  if (token) adminSessions.delete(token);
+  res.clearCookie('adm_session');
+  res.redirect('/admin/login-page');
+});
+
+// ── ADMIN: CRIAR CHAVE ────────────────────────────────────────────
+app.post('/admin/create-key', requireAdminSession, async (req, res) => {
+  const { note = '', key: customKey } = req.body;
+  // [FIX-6] Valida range de dias entre 1 e 365
+  const days      = Math.min(Math.max(parseInt(req.body.days) || 30, 1), 365);
+  const newKey    = customKey ? customKey.trim().toUpperCase().slice(0, 32) : generateKey();
+  const validTier = ['basic', 'full'].includes(req.body.tier) ? req.body.tier : 'basic';
+
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [newKey]);
+    if (rows.length > 0)
+      return res.json({ ok: false, error: 'Chave já existe.' });
+
+    await pool.query(
+      'INSERT INTO licenses (key, days, note, tier) VALUES ($1, $2, $3, $4)',
+      [newKey, days, note.slice(0, 200), validTier]  // note truncado a 200 chars
+    );
+
+    console.log(`[ADMIN] ✅ Chave criada: ${newKey} (${days}d — tier: ${validTier}) — ${note}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect('/admin');
+
+    return res.json({ ok: true, key: newKey, days, tier: validTier });
+
+  } catch (e) {
+    console.error('[CREATE-KEY] Erro:', e.message);
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
+// ── ADMIN: REVOGAR CHAVE ──────────────────────────────────────────
+app.post('/admin/revoke-key', requireAdminSession, async (req, res) => {
+  const cleanKey = (req.body.key || '').trim().toUpperCase().slice(0, 32);
+
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
+
+    await pool.query('UPDATE licenses SET revoked = TRUE WHERE key = $1', [cleanKey]);
+    console.log(`[ADMIN] 🚫 Revogada: ${cleanKey}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect('/admin');
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
+// ── ADMIN: EXTENDER DIAS ──────────────────────────────────────────
+app.post('/admin/extend-key', requireAdminSession, async (req, res) => {
+  const cleanKey  = (req.body.key || '').trim().toUpperCase().slice(0, 32);
+  // [FIX-6] Valida range de dias entre 1 e 365
+  const extraDays = Math.min(Math.max(parseInt(req.body.days) || 30, 1), 365);
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
+
+    const entry = rows[0];
+    const base  = entry.expires_at ? new Date(entry.expires_at) : new Date();
+    base.setDate(base.getDate() + extraDays);
+
+    await pool.query(
+      'UPDATE licenses SET expires_at = $1, revoked = FALSE WHERE key = $2',
+      [base.toISOString(), cleanKey]
+    );
+
+    console.log(`[ADMIN] ➕ ${cleanKey} +${extraDays}d → expira ${base.toISOString()}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect('/admin');
+
+    return res.json({ ok: true, expiresAt: base.toISOString() });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
+// ── ADMIN: RESETAR MÁQUINA ────────────────────────────────────────
+app.post('/admin/reset-machine', requireAdminSession, async (req, res) => {
+  const cleanKey = (req.body.key || '').trim().toUpperCase().slice(0, 32);
+
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
+
+    await pool.query(
+      'UPDATE licenses SET machine_id = NULL, activated_at = NULL, expires_at = NULL WHERE key = $1',
+      [cleanKey]
+    );
+
+    console.log(`[ADMIN] 🔄 Máquina resetada: ${cleanKey}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect('/admin');
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
+// ── ADMIN: ALTERAR TIER ───────────────────────────────────────────
+app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
+  const cleanKey = (req.body.key  || '').trim().toUpperCase().slice(0, 32);
+  const newTier  = ['basic', 'full'].includes(req.body.tier) ? req.body.tier : 'basic';
+
+  try {
+    const { rows } = await pool.query('SELECT key FROM licenses WHERE key = $1', [cleanKey]);
+    if (!rows.length) return res.json({ ok: false, error: 'Chave não encontrada.' });
+
+    await pool.query('UPDATE licenses SET tier = $1 WHERE key = $2', [newTier, cleanKey]);
+    console.log(`[ADMIN] 🔄 Tier de ${cleanKey} → ${newTier}`);
+
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/html'))
+      return res.redirect('/admin');
+
+    return res.json({ ok: true, tier: newTier });
+
+  } catch (e) {
+    return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────
-// Removida a contagem de chaves — informação desnecessária pública.
 app.get('/', async (req, res) => {
   try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', service: 'TTLM License Server v5 (Ed25519 + OfflineCert)' });
+    const { rows } = await pool.query('SELECT COUNT(*) FROM licenses');
+    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', keys: parseInt(rows[0].count) });
   } catch {
-    res.json({ status: 'degraded', service: 'TTLM License Server v5', db: 'reconectando...' });
+    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', db: 'conectando...' });
   }
 });
 
 // ── INICIAR ───────────────────────────────────────────────────────
 initDB().then(() => {
   app.listen(PORT, () => {
-    console.log(`\n══════════════════════════════════════════════`);
-    console.log(`   TTLM License Server v5`);
-    console.log(`   Porta       : ${PORT}`);
-    console.log(`   Admin       : /admin`);
-    console.log(`   Ed25519     : ✅`);
-    console.log(`   OfflineCert : ✅`);
-    console.log(`   Cookie Auth : ✅`);
-    console.log(`══════════════════════════════════════════════\n`);
+    console.log(`\n══════════════════════════════════════`);
+    console.log(`   TTLM License Server v4 (Ed25519)`);
+    console.log(`   Porta: ${PORT}`);
+    console.log(`   Admin: /admin/login-page`);
+    console.log(`   Criptografia: Ed25519 ✅`);
+    console.log(`══════════════════════════════════════\n`);
   });
 }).catch(e => {
   console.error('❌ Erro ao conectar no banco:', e.message);
