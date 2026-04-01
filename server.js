@@ -686,14 +686,17 @@ app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
 // Chamado pelo server.js local a cada 30 min para confirmar que a
 // licença ainda é válida. A resposta é assinada com Ed25519 e inclui
 // o nonce enviado pelo cliente (previne replay attacks).
+// [SEC] Verifica também o machineId — impede que uma chave vazada
+// seja usada em outra máquina sem passar pelo /activate (que bloquearia).
 // Um pirata não pode falsificar a resposta sem a chave privada.
 app.post('/heartbeat', async (req, res) => {
   if (!rateLimit(req, res, RATE_MAX_API)) return;
 
-  const cleanKey = ((req.body.key || '')).trim().toUpperCase().slice(0, 32);
-  const nonce    = (req.body.nonce || '').slice(0, 128).replace(/[^a-f0-9]/gi, '');
+  const cleanKey  = ((req.body.key || '')).trim().toUpperCase().slice(0, 32);
+  const nonce     = (req.body.nonce || '').slice(0, 128).replace(/[^a-f0-9]/gi, '');
+  const machineId = (req.body.machineId || '').slice(0, 64);
 
-  if (!cleanKey || !nonce) {
+  if (!cleanKey || !nonce || !machineId) {
     return res.status(400).json(signResponse({ valid: false, nonce: nonce || '', error: 'Parâmetros inválidos.' }));
   }
 
@@ -717,13 +720,22 @@ app.post('/heartbeat', async (req, res) => {
       return res.json(signResponse({ valid: false, nonce, error: 'Licença não ativada.' }));
     }
 
+    // [SEC] Verifica se a máquina que bate o heartbeat é a mesma que ativou.
+    // Sem essa checagem, qualquer pessoa com a chave pode usar o app em outra
+    // máquina indefinidamente — o /activate bloqueia na ativação, mas o
+    // heartbeat aceitava qualquer máquina mesmo após ativação vinculada.
+    if (entry.machine_id && entry.machine_id !== machineId) {
+      console.warn(`[HEARTBEAT] 🚫 Máquina não autorizada: ${cleanKey} — esperado ${entry.machine_id.slice(0, 8)}... recebido ${machineId.slice(0, 8)}...`);
+      return res.json(signResponse({ valid: false, nonce, error: 'Máquina não autorizada.' }));
+    }
+
     if (entry.expires_at && new Date(entry.expires_at) < new Date()) {
       console.warn(`[HEARTBEAT] ⏰ Chave expirada: ${cleanKey}`);
       return res.json(signResponse({ valid: false, nonce, error: 'Licença expirada.' }));
     }
 
-    // ✅ Licença ativa — resposta assinada com nonce ecoado (anti-replay)
-    console.log(`[HEARTBEAT] ✅ ${cleanKey} (tier: ${entry.tier})`);
+    // ✅ Licença ativa + máquina correta — resposta assinada com nonce ecoado (anti-replay)
+    console.log(`[HEARTBEAT] ✅ ${cleanKey} (tier: ${entry.tier}) — máquina ${machineId.slice(0, 8)}...`);
     return res.json(signResponse({ valid: true, nonce, tier: entry.tier }));
 
   } catch (e) {
