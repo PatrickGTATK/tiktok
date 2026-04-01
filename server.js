@@ -89,12 +89,9 @@ try {
 // ── BANCO DE DADOS (PostgreSQL) ───────────────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // [SEC-FIX] rejectUnauthorized:true — valida o certificado TLS do Supabase.
-  // O valor false desabilita completamente a verificação e abre a conexão a
-  // ataques MITM: um proxy malicioso pode ler/alterar queries e respostas.
-  // O Supabase usa certificados emitidos por CAs publicamente confiáveis,
-  // portanto a validação funciona sem configuração adicional.
-  ssl: { rejectUnauthorized: true },
+  // [TEMP] rejectUnauthorized:false — o Supabase usa CA própria (não pública).
+  // Substituir pelo Fix-A (pinnar o cert via SUPABASE_CA_CERT) assim que possível.
+  ssl: { rejectUnauthorized: false },
 });
 
 async function initDB() {
