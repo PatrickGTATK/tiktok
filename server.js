@@ -356,7 +356,7 @@ function renderLoginPage(errorMsg = '') {
     ? `<div class="err">${escapeHtml(errorMsg)}</div>`
     : '';
   return `<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Admin — TTLM</title>
+<title>Admin — LiveMacro Pro</title>
 <style>*{box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .box{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;min-width:320px;text-align:center}
 h2{color:#FFBE0B;margin-bottom:16px}p{color:#666;font-size:13px;margin-bottom:20px}
@@ -364,7 +364,7 @@ input{background:#0d1117;border:1px solid #30363d;color:#e0e0e0;padding:10px 14p
 button{background:linear-gradient(135deg,#FF006E,#8338EC);color:#fff;border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;font-weight:700;width:100%}
 .err{color:#FF006E;font-size:13px;margin-bottom:12px}
 </style></head><body>
-<div class="box"><h2>⚡ TTLM Admin</h2>
+<div class="box"><h2>⚡ LiveMacro Pro Admin</h2>
 <p>Faça login para acessar o painel</p>
 ${errHtml}
 <form method="POST" action="/admin/login">
@@ -436,7 +436,7 @@ app.get('/admin', requireAdminSession, async (req, res) => {
     const full   = keys.filter(k => k.tier === 'full').length;
 
     res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
-<title>Admin — TTLM Licenças</title>
+<title>Admin — LiveMacro Pro</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e0e0e0;padding:30px;min-height:100vh}
@@ -458,7 +458,7 @@ tr:hover{filter:brightness(1.2)}
 .crypto-badge{background:#0a1f0a;border:1px solid #1a4a1a;color:#06D6A0;padding:6px 14px;border-radius:8px;font-size:11px;font-family:monospace;margin-bottom:20px;display:inline-block}
 .logout{float:right;background:#333;color:#ccc;border:none;padding:6px 14px;border-radius:8px;cursor:pointer;font-size:12px;text-decoration:none}
 </style></head><body>
-<h1>⚡ TikTok Live Macro <a href="/admin/logout" class="logout">Sair</a></h1>
+<h1>⚡ LiveMacro Pro <a href="/admin/logout" class="logout">Sair</a></h1>
 <div class="sub">Painel de Licenças · ${new Date().toLocaleString('pt-BR')}</div>
 <div class="crypto-badge">🔐 Assinatura Ed25519 ativa — chave privada segura no servidor</div>
 
@@ -647,9 +647,9 @@ app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
 app.get('/', async (req, res) => {
   try {
     const { rows } = await pool.query('SELECT COUNT(*) FROM licenses');
-    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', keys: parseInt(rows[0].count) });
+    res.json({ status: 'ok', service: 'LiveMacro Pro License Server v4 (Ed25519)', keys: parseInt(rows[0].count) });
   } catch {
-    res.json({ status: 'ok', service: 'TTLM License Server v4 (Ed25519)', db: 'conectando...' });
+    res.json({ status: 'ok', service: 'LiveMacro Pro License Server v4 (Ed25519)', db: 'conectando...' });
   }
 });
 
@@ -657,7 +657,7 @@ app.get('/', async (req, res) => {
 initDB().then(() => {
   app.listen(PORT, () => {
     console.log(`\n══════════════════════════════════════`);
-    console.log(`   TTLM License Server v4 (Ed25519)`);
+    console.log(`   LiveMacro Pro License Server v4 (Ed25519)`);
     console.log(`   Porta: ${PORT}`);
     console.log(`   Admin: /admin/login-page`);
     console.log(`   Criptografia: Ed25519 ✅`);
