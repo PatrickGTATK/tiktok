@@ -38,6 +38,14 @@ const { Pool }     = require('pg');
 
 const app = express();
 
+// [SEC-FIX] trust proxy: informa ao Express que há exatamente 1 proxy
+// confiável à frente (o load balancer do Railway). Com isso req.ip resolve
+// para o IP real do cliente e o header X-Forwarded-For é lido de forma segura
+// (o Express descarta IPs injetados pelo cliente e usa apenas o adicionado
+// pelo proxy confiável). Sem essa configuração, qualquer cliente pode forjar
+// o header e bypassar o rate limit baseado em IP.
+app.set('trust proxy', 1);
+
 // [FIX-6] Limite de 10kb no body — previne flood e ataques de memória
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
@@ -81,7 +89,12 @@ try {
 // ── BANCO DE DADOS (PostgreSQL) ───────────────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  // [SEC-FIX] rejectUnauthorized:true — valida o certificado TLS do Supabase.
+  // O valor false desabilita completamente a verificação e abre a conexão a
+  // ataques MITM: um proxy malicioso pode ler/alterar queries e respostas.
+  // O Supabase usa certificados emitidos por CAs publicamente confiáveis,
+  // portanto a validação funciona sem configuração adicional.
+  ssl: { rejectUnauthorized: true },
 });
 
 async function initDB() {
@@ -187,9 +200,11 @@ function getCounter(map, id, now) {
 }
 
 function rateLimit(req, res, maxTries = RATE_MAX_API, keyToCheck = null) {
-  const ip  = req.headers['x-forwarded-for']?.split(',')[0].trim()
-            || req.socket.remoteAddress
-            || 'unknown';
+  // [SEC-FIX] Usa req.ip em vez de ler x-forwarded-for diretamente.
+  // Com app.set('trust proxy', 1) o Express valida a cadeia de proxies e
+  // entrega o IP real do cliente — sem isso um atacante envia qualquer valor
+  // em x-forwarded-for e bypassa o rate limit (IP spoofing trivial).
+  const ip  = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
 
   const ipRec = getCounter(ipAttempts, ip, now);
