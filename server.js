@@ -643,6 +643,57 @@ app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
   }
 });
 
+// ── HEARTBEAT — VALIDAÇÃO PERIÓDICA DO CLIENTE ───────────────────
+// Chamado pelo server.js local a cada 30 min para confirmar que a
+// licença ainda é válida. A resposta é assinada com Ed25519 e inclui
+// o nonce enviado pelo cliente (previne replay attacks).
+// Um pirata não pode falsificar a resposta sem a chave privada.
+app.post('/heartbeat', async (req, res) => {
+  if (!rateLimit(req, res, RATE_MAX_API)) return;
+
+  const cleanKey = ((req.body.key || '')).trim().toUpperCase().slice(0, 32);
+  const nonce    = (req.body.nonce || '').slice(0, 128).replace(/[^a-f0-9]/gi, '');
+
+  if (!cleanKey || !nonce) {
+    return res.status(400).json(signResponse({ valid: false, nonce: nonce || '', error: 'Parâmetros inválidos.' }));
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+
+    if (!rows.length) {
+      console.warn(`[HEARTBEAT] ❌ Chave não encontrada: ${cleanKey}`);
+      return res.json(signResponse({ valid: false, nonce, error: 'Chave não encontrada.' }));
+    }
+
+    const entry = rows[0];
+
+    if (entry.revoked) {
+      console.warn(`[HEARTBEAT] 🚫 Chave revogada: ${cleanKey}`);
+      return res.json(signResponse({ valid: false, nonce, error: 'Licença revogada.' }));
+    }
+
+    if (!entry.activated_at) {
+      console.warn(`[HEARTBEAT] ⚠️  Chave não ativada: ${cleanKey}`);
+      return res.json(signResponse({ valid: false, nonce, error: 'Licença não ativada.' }));
+    }
+
+    if (entry.expires_at && new Date(entry.expires_at) < new Date()) {
+      console.warn(`[HEARTBEAT] ⏰ Chave expirada: ${cleanKey}`);
+      return res.json(signResponse({ valid: false, nonce, error: 'Licença expirada.' }));
+    }
+
+    // ✅ Licença ativa — resposta assinada com nonce ecoado (anti-replay)
+    console.log(`[HEARTBEAT] ✅ ${cleanKey} (tier: ${entry.tier})`);
+    return res.json(signResponse({ valid: true, nonce, tier: entry.tier }));
+
+  } catch (e) {
+    console.error('[HEARTBEAT] Erro interno:', e.message);
+    // Não assina resposta de erro interno para não revelar detalhes
+    return res.status(500).json({ valid: false, error: 'Erro interno.' });
+  }
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────
 app.get('/', async (req, res) => {
   try {
