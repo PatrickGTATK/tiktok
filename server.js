@@ -74,6 +74,17 @@ if (!SIGNING_PRIVATE_KEY) {
   process.exit(1);
 }
 
+// Chave AES-256 usada para criptografar assets no build.
+// Gerada UMA VEZ via: node obfuscate.js (ou gerar-asset-key.js)
+// Cole o valor impresso no terminal como ASSET_KEY_HEX no Railway.
+// NUNCA commitar o valor — fica apenas aqui no Railway e no .asset-key local (gitignored).
+const ASSET_KEY_HEX = process.env.ASSET_KEY_HEX;
+if (!ASSET_KEY_HEX || !/^[0-9a-f]{64}$/i.test(ASSET_KEY_HEX)) {
+  console.error('❌ ASSET_KEY_HEX não configurado ou inválido (deve ser 64 hex chars = 32 bytes).');
+  console.error('   Execute: node obfuscate.js --print-asset-key  e cole o valor aqui.');
+  process.exit(1);
+}
+
 // Valida que a chave privada carrega corretamente na inicialização
 let privateKeyObject;
 try {
@@ -679,6 +690,71 @@ app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
 
   } catch (e) {
     return res.json({ ok: false, error: 'Erro interno.' });
+  }
+});
+
+// ── SESSION KEY — CHAVE DE ASSETS EFÊMERA ────────────────────────
+// Retorna a chave AES-256 que descriptografa os assets (.enc) do cliente.
+// A chave nunca fica no .asar — vive só na RAM do cliente durante a sessão.
+//
+// Proteções equivalentes ao /heartbeat:
+//   ❶ Licença válida + não revogada + não expirada
+//   ❷ machineId bate com o registrado na ativação
+//   ❸ Nonce ecoado na resposta assinada (anti-replay)
+//   ❹ Assinatura Ed25519 (impossível forjar sem chave privada)
+//
+// Sem uma session key válida os .enc são lixo binário — mesmo que alguém
+// extraia o .asar completo e compreenda todo o código do cliente.
+app.post('/session-key', async (req, res) => {
+  if (!rateLimit(req, res, RATE_MAX_API)) return;
+
+  const cleanKey  = (req.body.key       || '').trim().toUpperCase().slice(0, 32);
+  const machineId = (req.body.machineId || '').slice(0, 64);
+  const nonce     = (req.body.nonce     || '').slice(0, 128).replace(/[^a-f0-9]/gi, '');
+
+  if (!cleanKey || !machineId || !nonce) {
+    return res.status(400).json(signResponse({ ok: false, nonce: nonce || '', error: 'Parâmetros inválidos.' }));
+  }
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
+
+    if (!entry || !entry.activated_at) {
+      console.warn(`[SESSION-KEY] ❌ Chave não encontrada/ativada: ${cleanKey}`);
+      return res.json(signResponse({ ok: false, nonce, error: 'Licença não encontrada.' }));
+    }
+
+    if (entry.revoked) {
+      console.warn(`[SESSION-KEY] 🚫 Chave revogada: ${cleanKey}`);
+      return res.json(signResponse({ ok: false, nonce, error: 'Licença revogada.' }));
+    }
+
+    // ❷ Verifica machineId — impede uso da chave em outra máquina
+    if (entry.machine_id && entry.machine_id !== machineId) {
+      console.warn(`[SESSION-KEY] 🚫 Máquina não autorizada: ${cleanKey} — esperado ${entry.machine_id.slice(0, 8)}... recebido ${machineId.slice(0, 8)}...`);
+      return res.json(signResponse({ ok: false, nonce, error: 'Máquina não autorizada.' }));
+    }
+
+    if (entry.expires_at && new Date(entry.expires_at) < new Date()) {
+      console.warn(`[SESSION-KEY] ⏰ Licença expirada: ${cleanKey}`);
+      return res.json(signResponse({ ok: false, nonce, error: 'Licença expirada.' }));
+    }
+
+    // ✅ Licença válida — retorna a chave de assets (assinada com Ed25519 + nonce)
+    // A chave é a mesma para todos os clientes válidos (gerada no build, rotacionada manualmente).
+    // O nonce garante que esta resposta não pode ser reutilizada em outra sessão.
+    console.log(`[SESSION-KEY] ✅ ${cleanKey} (tier: ${entry.tier}) — máquina ${machineId.slice(0, 8)}...`);
+    return res.json(signResponse({
+      ok:         true,
+      nonce,
+      sessionKey: ASSET_KEY_HEX,   // hex string — cliente converte para Buffer
+      tier:       entry.tier || 'basic',
+    }));
+
+  } catch (e) {
+    console.error('[SESSION-KEY] Erro interno:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno.' });
   }
 });
 
