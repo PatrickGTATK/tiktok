@@ -34,6 +34,8 @@
 const express      = require('express');
 const cookieParser = require('cookie-parser');
 const crypto       = require('crypto');
+const fs           = require('fs');
+const path         = require('path');
 const { Pool }     = require('pg');
 
 const app = express();
@@ -84,22 +86,6 @@ if (!ASSET_KEY_HEX || !/^[0-9a-f]{64}$/i.test(ASSET_KEY_HEX)) {
   console.error('   Execute: node obfuscate.js --print-asset-key  e cole o valor aqui.');
   process.exit(1);
 }
-
-// Pasta onde ficam os arquivos .dll distribuídos aos clientes Full.
-// No Railway: crie a pasta "dlls/" na raiz do projeto e coloque os arquivos lá.
-// Variável de ambiente opcional — padrão: ./dlls  (relativo ao __dirname)
-const DLL_DIR = process.env.DLL_DIR
-  ? process.env.DLL_DIR
-  : require('path').join(__dirname, 'dlls');
-
-// Allowlist de arquivos DLL disponíveis para download.
-// Apenas nomes listados aqui podem ser solicitados — bloqueia path traversal e
-// downloads de arquivos arbitrários mesmo que alguém manipule o campo "file".
-const DLL_ALLOWLIST = new Set([
-  'UnifiedWebhook.dll',
-  // Adicione outros arquivos aqui conforme necessário:
-  // 'OutroMod.dll',
-]);
 
 // Valida que a chave privada carrega corretamente na inicialização
 let privateKeyObject;
@@ -774,106 +760,6 @@ app.post('/session-key', async (req, res) => {
   }
 });
 
-// ── DOWNLOAD DE DLL (plano Full) ─────────────────────────────────
-// Serve arquivos .dll protegidos apenas para licenças Full válidas.
-//
-// Proteções:
-//   ❶ Rate limit por IP (3 downloads/min — arquivo grande)
-//   ❷ Licença válida + não revogada + não expirada
-//   ❸ machineId bate com o registrado na ativação (anti-compartilhamento)
-//   ❹ Tier obrigatoriamente "full" — basic é rejeitado com 403
-//   ❺ Allowlist de nomes de arquivo — bloqueia path traversal
-//   ❻ Log de cada download com chave truncada + IP para auditoria
-//
-// Campo opcional "file" no body — se ausente, entrega UnifiedWebhook.dll.
-// Pronto para múltiplas DLLs: basta adicionar nomes à DLL_ALLOWLIST.
-const RATE_MAX_DLL = 3; // downloads por minuto por IP (arquivo grande)
-
-app.post('/dll/download', async (req, res) => {
-  // ❶ Rate limit dedicado (mais restrito que a API padrão)
-  if (!rateLimit(req, res, RATE_MAX_DLL)) return;
-
-  const cleanKey  = ((req.body?.key       || '').trim().toUpperCase()).slice(0, 32);
-  const machineId = ((req.body?.machineId || '')).slice(0, 64);
-  const fileName  = ((req.body?.file      || 'UnifiedWebhook.dll').trim()).slice(0, 64);
-
-  if (!cleanKey || !machineId) {
-    return res.status(400).json({ ok: false, error: 'Parâmetros inválidos.' });
-  }
-
-  // ❺ Allowlist — rejeita qualquer nome fora da lista autorizada
-  if (!DLL_ALLOWLIST.has(fileName)) {
-    console.warn(`[DLL] ⛔ Arquivo não autorizado: "${fileName}" — chave ${cleanKey.slice(0, 8)}...`);
-    return res.status(400).json({ ok: false, error: 'Arquivo não autorizado.' });
-  }
-
-  try {
-    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
-    const entry = rows[0];
-
-    // ❷ Licença existe e foi ativada
-    if (!entry || !entry.activated_at) {
-      console.warn(`[DLL] ❌ Chave não encontrada/ativada: ${cleanKey.slice(0, 8)}...`);
-      return res.status(403).json({ ok: false, error: 'Licença não encontrada.' });
-    }
-
-    if (entry.revoked) {
-      console.warn(`[DLL] 🚫 Chave revogada: ${cleanKey.slice(0, 8)}...`);
-      return res.status(403).json({ ok: false, error: 'Licença revogada.' });
-    }
-
-    if (entry.expires_at && new Date(entry.expires_at) < new Date()) {
-      console.warn(`[DLL] ⏰ Chave expirada: ${cleanKey.slice(0, 8)}...`);
-      return res.status(403).json({ ok: false, error: 'Licença expirada.' });
-    }
-
-    // ❸ Verifica machineId — mesmo mecanismo do /heartbeat
-    if (entry.machine_id && entry.machine_id !== machineId) {
-      console.warn(`[DLL] 🚫 Máquina não autorizada: ${cleanKey.slice(0, 8)}... — esperado ${(entry.machine_id || '').slice(0, 8)}... recebido ${machineId.slice(0, 8)}...`);
-      return res.status(403).json({ ok: false, error: 'Máquina não autorizada.' });
-    }
-
-    // ❹ Tier Full obrigatório
-    if ((entry.tier || 'basic') !== 'full') {
-      console.warn(`[DLL] 🔒 Tier insuficiente: ${cleanKey.slice(0, 8)}... (tier: ${entry.tier})`);
-      return res.status(403).json({ ok: false, error: 'Recurso exclusivo do plano Full.' });
-    }
-
-    // ❺ Resolve caminho absoluto e valida que está dentro de DLL_DIR
-    const path    = require('path');
-    const fs      = require('fs');
-    const dllPath = path.resolve(DLL_DIR, fileName);
-    const dllBase = path.resolve(DLL_DIR);
-
-    // Dupla checagem: resolve() + startsWith() — bloqueia ../../../etc/passwd etc.
-    if (!dllPath.startsWith(dllBase + path.sep) && dllPath !== dllBase) {
-      console.warn(`[DLL] ⛔ Path traversal bloqueado: "${fileName}"`);
-      return res.status(400).json({ ok: false, error: 'Arquivo não autorizado.' });
-    }
-
-    if (!fs.existsSync(dllPath)) {
-      console.error(`[DLL] ❌ Arquivo não encontrado no servidor: ${dllPath}`);
-      return res.status(404).json({ ok: false, error: 'Arquivo não disponível no momento. Tente novamente mais tarde.' });
-    }
-
-    // ❻ Log de auditoria — chave truncada por privacidade
-    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-    console.log(`[DLL] ✅ Download autorizado — chave: ${cleanKey.slice(0, 8)}... | tier: ${entry.tier} | máquina: ${machineId.slice(0, 8)}... | arquivo: ${fileName} | IP: ${ip}`);
-
-    const stat = fs.statSync(dllPath);
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
-    res.setHeader('Content-Length', stat.size);
-    res.setHeader('Cache-Control', 'no-store'); // nunca cacheia — DLL pode ser atualizada
-
-    fs.createReadStream(dllPath).pipe(res);
-
-  } catch (e) {
-    console.error('[DLL] Erro interno:', e.message);
-    return res.status(500).json({ ok: false, error: 'Erro interno do servidor.' });
-  }
-});
-
 // ── HEARTBEAT — VALIDAÇÃO PERIÓDICA DO CLIENTE ───────────────────
 // Chamado pelo server.js local a cada 30 min para confirmar que a
 // licença ainda é válida. A resposta é assinada com Ed25519 e inclui
@@ -937,52 +823,68 @@ app.post('/heartbeat', async (req, res) => {
   }
 });
 
-// ── HEALTH CHECK ──────────────────────────────────────────────────
-app.get('/', async (req, res) => {
-  const fs   = require('fs');
-  const path = require('path');
+// ── DOWNLOAD DA DLL (requer licença full ativa) ───────────────────
+app.post('/download-dll', async (req, res) => {
+  const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
+  const machineId = ((req.body?.machineId || '')).slice(0, 64);
 
-  // Mapeia quais DLLs da allowlist estão de fato presentes no servidor
-  const dllsPresentes = [...DLL_ALLOWLIST].filter(f => {
-    try { return fs.existsSync(path.join(DLL_DIR, f)); } catch { return false; }
-  });
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.status(400).json({ ok: false, error: 'Dados incompletos.' });
 
   try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
+
+    if (!entry || !entry.activated_at)
+      return res.status(403).json({ ok: false, error: 'Chave não encontrada.' });
+
+    if (entry.revoked)
+      return res.status(403).json({ ok: false, error: 'Chave revogada.' });
+
+    if (entry.machine_id !== machineId)
+      return res.status(403).json({ ok: false, error: 'Máquina não autorizada.' });
+
+    if (new Date() > new Date(entry.expires_at))
+      return res.status(403).json({ ok: false, error: 'Licença expirada.' });
+
+    if ((entry.tier || 'basic') !== 'full')
+      return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
+
+    const dllPath = path.join('/app/dlls', 'UnifiedWebhook.dll');
+    if (!fs.existsSync(dllPath))
+      return res.status(404).json({ ok: false, error: 'Arquivo não encontrado no servidor.' });
+
+    console.log(`[DLL] ✅ Download autorizado — ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="UnifiedWebhook.dll"');
+    fs.createReadStream(dllPath).pipe(res);
+
+  } catch (e) {
+    console.error('[DLL] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno do servidor.' });
+  }
+});
+
+// ── HEALTH CHECK ──────────────────────────────────────────────────
+app.get('/', async (req, res) => {
+  try {
     const { rows } = await pool.query('SELECT COUNT(*) FROM licenses');
-    res.json({
-      status: 'ok',
-      service: 'LiveMacro Pro License Server v4 (Ed25519)',
-      keys: parseInt(rows[0].count),
-      dlls: dllsPresentes,
-    });
+    res.json({ status: 'ok', service: 'LiveMacro Pro License Server v4 (Ed25519)', keys: parseInt(rows[0].count) });
   } catch {
-    res.json({
-      status: 'ok',
-      service: 'LiveMacro Pro License Server v4 (Ed25519)',
-      db: 'conectando...',
-      dlls: dllsPresentes,
-    });
+    res.json({ status: 'ok', service: 'LiveMacro Pro License Server v4 (Ed25519)', db: 'conectando...' });
   }
 });
 
 // ── INICIAR ───────────────────────────────────────────────────────
 initDB().then(() => {
-  // Verifica DLLs disponíveis na inicialização
-  const fs   = require('fs');
-  const path = require('path');
-  const dllsStatus = [...DLL_ALLOWLIST].map(f => {
-    const exists = (() => { try { return fs.existsSync(path.join(DLL_DIR, f)); } catch { return false; } })();
-    return `   ${exists ? '✅' : '❌'} ${f}`;
-  }).join('\n');
-
   app.listen(PORT, () => {
     console.log(`\n══════════════════════════════════════`);
     console.log(`   LiveMacro Pro License Server v4 (Ed25519)`);
     console.log(`   Porta: ${PORT}`);
     console.log(`   Admin: /admin/login-page`);
     console.log(`   Criptografia: Ed25519 ✅`);
-    console.log(`   DLLs disponíveis (${DLL_DIR}):`);
-    console.log(dllsStatus);
     console.log(`══════════════════════════════════════\n`);
   });
 }).catch(e => {
