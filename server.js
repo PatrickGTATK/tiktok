@@ -813,8 +813,22 @@ app.post('/heartbeat', async (req, res) => {
     }
 
     // ✅ Licença ativa + máquina correta — resposta assinada com nonce ecoado (anti-replay)
+    // ── Session key HMAC ─────────────────────────────────────────────────
+    // Derivada de: chave + machineId + data UTC de hoje.
+    // Muda automaticamente a cada dia — sem necessidade de rotação manual.
+    // Incluída na resposta ANTES de assinar com Ed25519 → impossível de forjar.
+    // O server.js local usa esta chave para assinar cada webhook de spawn.
+    // A DLL verifica o HMAC em todo comando recebido — sem ela, 0 spawns,
+    // mesmo que o pirata remende CheckLicense() para retornar true.
+    const _skDate  = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const _skInput = `${cleanKey}:${machineId}:${_skDate}`;
+    const _skHex   = crypto
+      .createHmac('sha256', SIGNING_PRIVATE_KEY)
+      .update(_skInput)
+      .digest('hex'); // 64 chars hex = 32 bytes
+
     console.log(`[HEARTBEAT] ✅ ${cleanKey} (tier: ${entry.tier}) — máquina ${machineId.slice(0, 8)}...`);
-    return res.json(signResponse({ valid: true, nonce, tier: entry.tier }));
+    return res.json(signResponse({ valid: true, nonce, tier: entry.tier, sk: _skHex }));
 
   } catch (e) {
     console.error('[HEARTBEAT] Erro interno:', e.message);
