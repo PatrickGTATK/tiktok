@@ -823,6 +823,50 @@ app.post('/heartbeat', async (req, res) => {
   }
 });
 
+// ── DOWNLOAD DA DLL (requer licença full ativa) ───────────────────
+app.post('/download-dll', async (req, res) => {
+  const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
+  const machineId = ((req.body?.machineId || '')).slice(0, 64);
+
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.status(400).json({ ok: false, error: 'Dados incompletos.' });
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
+
+    if (!entry || !entry.activated_at)
+      return res.status(403).json({ ok: false, error: 'Chave não encontrada.' });
+
+    if (entry.revoked)
+      return res.status(403).json({ ok: false, error: 'Chave revogada.' });
+
+    if (entry.machine_id !== machineId)
+      return res.status(403).json({ ok: false, error: 'Máquina não autorizada.' });
+
+    if (new Date() > new Date(entry.expires_at))
+      return res.status(403).json({ ok: false, error: 'Licença expirada.' });
+
+    if ((entry.tier || 'basic') !== 'full')
+      return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
+
+    const dllPath = path.join(__dirname, 'dlls', 'UnifiedWebhook.dll');
+    if (!fs.existsSync(dllPath))
+      return res.status(404).json({ ok: false, error: 'Arquivo não encontrado no servidor.' });
+
+    console.log(`[DLL] ✅ Download autorizado — ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="UnifiedWebhook.dll"');
+    fs.createReadStream(dllPath).pipe(res);
+
+  } catch (e) {
+    console.error('[DLL] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno do servidor.' });
+  }
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────
 app.get('/', async (req, res) => {
   try {
@@ -843,7 +887,7 @@ initDB().then(() => {
     console.log(`   Criptografia: Ed25519 ✅`);
 
     // ── Listar DLLs disponíveis para download ──────────────────
-    const dllsDir = '/app/dlls';
+    const dllsDir = path.join(__dirname, 'dlls');
     try {
       if (fs.existsSync(dllsDir)) {
         const dlls = fs.readdirSync(dllsDir).filter(f => f.endsWith('.dll'));
