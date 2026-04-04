@@ -34,6 +34,8 @@
 const express      = require('express');
 const cookieParser = require('cookie-parser');
 const crypto       = require('crypto');
+const fs           = require('fs');
+const path         = require('path');
 const { Pool }     = require('pg');
 
 const app = express();
