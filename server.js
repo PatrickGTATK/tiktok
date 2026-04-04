@@ -837,8 +837,8 @@ app.post('/heartbeat', async (req, res) => {
   }
 });
 
-// ── DOWNLOAD DA DLL (requer licença full ativa) ───────────────────
-app.post('/download-dll', async (req, res) => {
+// ── LISTAR DLLs DISPONÍVEIS (requer licença full ativa) ──────────
+app.post('/list-dlls', async (req, res) => {
   const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
   const machineId = ((req.body?.machineId || '')).slice(0, 64);
 
@@ -866,13 +866,80 @@ app.post('/download-dll', async (req, res) => {
     if ((entry.tier || 'basic') !== 'full')
       return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
 
-    const dllPath = path.join(__dirname, 'dlls', 'UnifiedWebhook.dll');
-    if (!fs.existsSync(dllPath))
-      return res.status(404).json({ ok: false, error: 'Arquivo não encontrado no servidor.' });
+    const dllsDir = path.join(__dirname, 'dlls');
+    if (!fs.existsSync(dllsDir))
+      return res.status(404).json({ ok: false, error: 'Pasta dlls não encontrada no servidor.' });
 
-    console.log(`[DLL] ✅ Download autorizado — ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
+    const dlls = fs.readdirSync(dllsDir).filter(f => f.endsWith('.dll'));
+    if (dlls.length === 0)
+      return res.status(404).json({ ok: false, error: 'Nenhuma DLL disponível no servidor.' });
+
+    console.log(`[LIST-DLL] ✅ ${cleanKey} — ${dlls.length} DLL(s): ${dlls.join(', ')}`);
+    return res.json({ ok: true, dlls });
+
+  } catch (e) {
+    console.error('[LIST-DLL] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno do servidor.' });
+  }
+});
+
+// ── DOWNLOAD DA DLL (requer licença full ativa) ───────────────────
+// Aceita campo opcional "dllName" no body para baixar uma DLL específica.
+// Se não informado, baixa a primeira DLL disponível (compatibilidade).
+app.post('/download-dll', async (req, res) => {
+  const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
+  const machineId = ((req.body?.machineId || '')).slice(0, 64);
+  // [SEC] path.basename impede path traversal — garante apenas o nome do arquivo
+  const dllName   = req.body?.dllName ? path.basename(req.body.dllName) : null;
+
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.status(400).json({ ok: false, error: 'Dados incompletos.' });
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
+
+    if (!entry || !entry.activated_at)
+      return res.status(403).json({ ok: false, error: 'Chave não encontrada.' });
+
+    if (entry.revoked)
+      return res.status(403).json({ ok: false, error: 'Chave revogada.' });
+
+    if (entry.machine_id !== machineId)
+      return res.status(403).json({ ok: false, error: 'Máquina não autorizada.' });
+
+    if (new Date() > new Date(entry.expires_at))
+      return res.status(403).json({ ok: false, error: 'Licença expirada.' });
+
+    if ((entry.tier || 'basic') !== 'full')
+      return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
+
+    const dllsDir = path.join(__dirname, 'dlls');
+
+    // Se dllName não foi informado, usa a primeira DLL da pasta (compatibilidade)
+    let resolvedName = dllName;
+    if (!resolvedName) {
+      const available = fs.existsSync(dllsDir)
+        ? fs.readdirSync(dllsDir).filter(f => f.endsWith('.dll'))
+        : [];
+      if (available.length === 0)
+        return res.status(404).json({ ok: false, error: 'Nenhuma DLL disponível no servidor.' });
+      resolvedName = available[0];
+    }
+
+    // [SEC] Só permite .dll — rejeita extensões inesperadas mesmo após basename
+    if (!resolvedName.endsWith('.dll'))
+      return res.status(400).json({ ok: false, error: 'Nome de arquivo inválido.' });
+
+    const dllPath = path.join(dllsDir, resolvedName);
+    if (!fs.existsSync(dllPath))
+      return res.status(404).json({ ok: false, error: `Arquivo "${resolvedName}" não encontrado no servidor.` });
+
+    console.log(`[DLL] ✅ Download autorizado — ${resolvedName} — ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
     res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', 'attachment; filename="UnifiedWebhook.dll"');
+    res.setHeader('Content-Disposition', `attachment; filename="${resolvedName}"`);
     fs.createReadStream(dllPath).pipe(res);
 
   } catch (e) {
