@@ -37,6 +37,7 @@ const crypto       = require('crypto');
 const fs           = require('fs');
 const path         = require('path');
 const { Pool }     = require('pg');
+const multer       = require('multer');
 
 const app = express();
 
@@ -49,9 +50,31 @@ const app = express();
 app.set('trust proxy', 1);
 
 // [FIX-6] Limite de 10kb no body — previne flood e ataques de memória
+// Nota: uploads de DLL usam multipart/form-data via multer (limite separado de 500MB)
 app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: true, limit: '10kb' }));
 app.use(cookieParser());
+
+// ── UPLOAD DE DLLs (multer) ───────────────────────────────────────
+// O diretório de DLLs pode vir de variável de ambiente (Railway Volume)
+// ou cair no padrão __dirname/dlls
+const DLLS_DIR = process.env.DLLS_DIR || path.join(__dirname, 'dlls');
+if (!fs.existsSync(DLLS_DIR)) fs.mkdirSync(DLLS_DIR, { recursive: true });
+
+const dllStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, DLLS_DIR),
+  filename:    (_req,  file, cb) => cb(null, path.basename(file.originalname)),
+});
+
+const uploadDll = multer({
+  storage: dllStorage,
+  limits:  { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB máximo
+  fileFilter: (_req, file, cb) => {
+    if (!file.originalname.toLowerCase().endsWith('.dll'))
+      return cb(new Error('Apenas arquivos .dll são permitidos.'));
+    cb(null, true);
+  },
+});
 
 const PORT               = process.env.PORT               || 3000;
 const SIGNING_PRIVATE_KEY = process.env.SIGNING_PRIVATE_KEY || null;
@@ -487,6 +510,31 @@ app.get('/admin', requireAdminSession, async (req, res) => {
     const expir  = keys.filter(k => k.activated_at && !k.revoked && now >= new Date(k.expires_at || 0)).length;
     const full   = keys.filter(k => k.tier === 'full').length;
 
+    // ── DLLs disponíveis no servidor ──────────────────────────────
+    let dllsHtml = '';
+    try {
+      const dlls = fs.existsSync(DLLS_DIR)
+        ? fs.readdirSync(DLLS_DIR).filter(f => f.endsWith('.dll'))
+        : [];
+      if (dlls.length === 0) {
+        dllsHtml = '<p style="color:#666;font-size:13px;margin:0">Nenhuma DLL no servidor ainda.</p>';
+      } else {
+        dllsHtml = dlls.map(dll => {
+          const safeDll = escapeHtml(dll);
+          const sizeMB  = (fs.statSync(path.join(DLLS_DIR, dll)).size / 1024 / 1024).toFixed(2);
+          return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #21262d">
+            <span style="font-family:monospace;font-size:13px;flex:1">📦 ${safeDll} <span style="color:#555;font-size:11px">(${sizeMB} MB)</span></span>
+            <form method="POST" action="/admin/delete-dll" onsubmit="return confirm('Excluir ${safeDll}?')">
+              <input type="hidden" name="dllName" value="${safeDll}"/>
+              <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px">🗑 Excluir</button>
+            </form>
+          </div>`;
+        }).join('');
+      }
+    } catch (e) {
+      dllsHtml = `<p style="color:#FF006E;font-size:13px">Erro ao listar DLLs: ${escapeHtml(e.message)}</p>`;
+    }
+
     res.send(`<!DOCTYPE html><html lang="pt-BR"><head><meta charset="UTF-8">
 <title>Admin — LiveMacro Pro</title>
 <style>
@@ -521,6 +569,16 @@ tr:hover{filter:brightness(1.2)}
   <div class="stat"><b style="color:#FF006E">${revog}</b><span>Revogadas</span></div>
   <div class="stat"><b style="color:#FFBE0B">${expir}</b><span>Expiradas</span></div>
   <div class="stat"><b style="color:#8338EC">${full}</b><span>Tier Full</span></div>
+</div>
+
+<div class="card">
+  <h3>📦 Gerenciar DLLs</h3>
+  <form method="POST" action="/admin/upload-dll" enctype="multipart/form-data" style="margin-bottom:16px">
+    <input type="file" name="dll" accept=".dll" required style="margin-bottom:8px"/>
+    <button type="submit">⬆ Fazer Upload</button>
+    <span style="font-size:11px;color:#555;margin-left:8px">Máx 2 GB · apenas .dll</span>
+  </form>
+  <div id="dll-list">${dllsHtml}</div>
 </div>
 
 <div class="card">
@@ -695,6 +753,46 @@ app.post('/admin/set-tier', requireAdminSession, async (req, res) => {
   }
 });
 
+// ── ADMIN: UPLOAD DE DLL ──────────────────────────────────────────
+app.post('/admin/upload-dll', requireAdminSession, (req, res) => {
+  uploadDll.single('dll')(req, res, (err) => {
+    if (err) {
+      console.error('[ADMIN-UPLOAD] ❌ Erro no upload:', err.message);
+      return res.status(400).send(`<script>alert("Erro: ${err.message}"); history.back();</script>`);
+    }
+
+    if (!req.file) {
+      return res.status(400).send('<script>alert("Nenhum arquivo enviado."); history.back();</script>');
+    }
+
+    console.log(`[ADMIN-UPLOAD] ✅ DLL enviada: ${req.file.originalname} (${(req.file.size / 1024 / 1024).toFixed(2)} MB)`);
+    return res.redirect('/admin');
+  });
+});
+
+// ── ADMIN: EXCLUIR DLL ────────────────────────────────────────────
+app.post('/admin/delete-dll', requireAdminSession, (req, res) => {
+  // [SEC] path.basename impede path traversal
+  const dllName = path.basename((req.body.dllName || '').trim());
+
+  if (!dllName || !dllName.endsWith('.dll'))
+    return res.status(400).send('<script>alert("Nome de arquivo inválido."); history.back();</script>');
+
+  const dllPath = path.join(DLLS_DIR, dllName);
+
+  if (!fs.existsSync(dllPath))
+    return res.status(404).send('<script>alert("Arquivo não encontrado."); history.back();</script>');
+
+  try {
+    fs.unlinkSync(dllPath);
+    console.log(`[ADMIN-DELETE] 🗑 DLL excluída: ${dllName}`);
+    return res.redirect('/admin');
+  } catch (e) {
+    console.error('[ADMIN-DELETE] ❌ Erro ao excluir:', e.message);
+    return res.status(500).send(`<script>alert("Erro ao excluir: ${e.message}"); history.back();</script>`);
+  }
+});
+
 // ── SESSION KEY — CHAVE DE ASSETS EFÊMERA ────────────────────────
 // Retorna a chave AES-256 que descriptografa os assets (.enc) do cliente.
 // A chave nunca fica no .asar — vive só na RAM do cliente durante a sessão.
@@ -866,7 +964,7 @@ app.post('/list-dlls', async (req, res) => {
     if ((entry.tier || 'basic') !== 'full')
       return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
 
-    const dllsDir = path.join(__dirname, 'dlls');
+    const dllsDir = DLLS_DIR;
     if (!fs.existsSync(dllsDir))
       return res.status(404).json({ ok: false, error: 'Pasta dlls não encontrada no servidor.' });
 
@@ -916,7 +1014,7 @@ app.post('/download-dll', async (req, res) => {
     if ((entry.tier || 'basic') !== 'full')
       return res.status(403).json({ ok: false, error: 'Requer plano Full.' });
 
-    const dllsDir = path.join(__dirname, 'dlls');
+    const dllsDir = DLLS_DIR;
 
     // Se dllName não foi informado, usa a primeira DLL da pasta (compatibilidade)
     let resolvedName = dllName;
@@ -968,7 +1066,7 @@ initDB().then(() => {
     console.log(`   Criptografia: Ed25519 ✅`);
 
     // ── Listar DLLs disponíveis para download ──────────────────
-    const dllsDir = path.join(__dirname, 'dlls');
+    const dllsDir = DLLS_DIR;
     try {
       if (fs.existsSync(dllsDir)) {
         const dlls = fs.readdirSync(dllsDir).filter(f => f.endsWith('.dll'));
