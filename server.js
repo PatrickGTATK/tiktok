@@ -522,12 +522,8 @@ app.get('/admin', requireAdminSession, async (req, res) => {
         dllsHtml = dlls.map(dll => {
           const safeDll = escapeHtml(dll);
           const sizeMB  = (fs.statSync(path.join(DLLS_DIR, dll)).size / 1024 / 1024).toFixed(2);
-          return `<div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #21262d">
-            <span style="font-family:monospace;font-size:13px;flex:1">📦 ${safeDll} <span style="color:#555;font-size:11px">(${sizeMB} MB)</span></span>
-            <form method="POST" action="/admin/delete-dll" onsubmit="return confirm('Excluir ${safeDll}?')">
-              <input type="hidden" name="dllName" value="${safeDll}"/>
-              <button type="submit" style="background:#FF006E;color:#fff;border:none;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:11px">🗑 Excluir</button>
-            </form>
+          return `<div style="padding:8px 0;border-bottom:1px solid #21262d">
+            <span style="font-family:monospace;font-size:13px">📦 ${safeDll} <span style="color:#555;font-size:11px">(${sizeMB} MB)</span></span>
           </div>`;
         }).join('');
       }
@@ -572,12 +568,7 @@ tr:hover{filter:brightness(1.2)}
 </div>
 
 <div class="card">
-  <h3>📦 Gerenciar DLLs</h3>
-  <form method="POST" action="/admin/upload-dll" enctype="multipart/form-data" style="margin-bottom:16px">
-    <input type="file" name="dll" accept=".dll" required style="margin-bottom:8px"/>
-    <button type="submit">⬆ Fazer Upload</button>
-    <span style="font-size:11px;color:#555;margin-left:8px">Máx 2 GB · apenas .dll</span>
-  </form>
+  <h3>📦 DLLs no Servidor</h3>
   <div id="dll-list">${dllsHtml}</div>
 </div>
 
