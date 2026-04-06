@@ -1037,6 +1037,51 @@ app.post('/download-dll', async (req, res) => {
   }
 });
 
+// ── PASTA DE SKINS (.oiv) ─────────────────────────────────────────
+const SKINS_DIR = process.env.SKINS_DIR || path.join(__dirname, 'skins');
+if (!fs.existsSync(SKINS_DIR)) fs.mkdirSync(SKINS_DIR, { recursive: true });
+
+// ── DOWNLOAD DA SKIN .OIV (requer licença ativa — basic ou full) ──
+app.post('/download-skin', async (req, res) => {
+  const cleanKey  = ((req.body?.key || '').trim().toUpperCase()).slice(0, 32);
+  const machineId = ((req.body?.machineId || '')).slice(0, 64);
+
+  if (!rateLimit(req, res, RATE_MAX_API, cleanKey)) return;
+
+  if (!cleanKey || !machineId)
+    return res.status(400).json({ ok: false, error: 'Dados incompletos.' });
+
+  try {
+    const { rows } = await pool.query('SELECT * FROM licenses WHERE key = $1', [cleanKey]);
+    const entry = rows[0];
+
+    if (!entry || !entry.activated_at)
+      return res.status(403).json({ ok: false, error: 'Chave não encontrada.' });
+
+    if (entry.revoked)
+      return res.status(403).json({ ok: false, error: 'Chave revogada.' });
+
+    if (entry.machine_id !== machineId)
+      return res.status(403).json({ ok: false, error: 'Máquina não autorizada.' });
+
+    if (new Date() > new Date(entry.expires_at))
+      return res.status(403).json({ ok: false, error: 'Licença expirada.' });
+
+    const skinFile = path.join(SKINS_DIR, 'livemacropro-skins.oiv');
+    if (!fs.existsSync(skinFile))
+      return res.status(404).json({ ok: false, error: 'Arquivo de skins não encontrado no servidor.' });
+
+    console.log(`[SKIN] ✅ Download autorizado — livemacropro-skins.oiv — ${cleanKey} — máquina ${machineId.slice(0, 8)}...`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', 'attachment; filename="livemacropro-skins.oiv"');
+    fs.createReadStream(skinFile).pipe(res);
+
+  } catch (e) {
+    console.error('[SKIN] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno do servidor.' });
+  }
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────
 app.get('/', async (req, res) => {
   try {
